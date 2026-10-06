@@ -316,6 +316,41 @@
     (is (not (:ok r5)))
     (is (= :queue-drained (get-in r5 [:error :code])))))
 
+(deftest set-table-types-replaces-config
+  (let [r (d/set-table-types {} (dissoc d/default-table-types :large))
+        s (:state r)]
+    (is (:ok r))
+    (is (= #{:two :three} (set (keys (:table-types s)))))
+    (is (= #{:two :three} (set (keys (:queues s))))))
+  (testing "非 map 配置被拒绝"
+    (is (not (:ok (d/set-table-types {} [:two]))))
+    (is (= :invalid-table-types (get-in (d/set-table-types {} nil) [:error :code])))))
+
+(deftest table-type-config-change-snapshot-semantics
+  (let [r1 (d/create-ticket {} 4 "remote" now "tok-large" "id-large")
+        s1 (:state r1)
+        s2 (:state (d/set-table-types s1 (dissoc d/default-table-types :large)))]
+    (is (= :large (:table-type (:value r1))))
+    (testing "配置变更后新取号不再匹配到已停用桌型"
+      (let [r2 (d/create-ticket s2 4 "remote" now "tok-new" "id-new")]
+        (is (not (:ok r2)))
+        (is (= :no-matching-table-type (get-in r2 [:error :code])))))
+    (testing "配置变更不影响其余桌型取号"
+      (let [r3 (d/create-ticket s2 2 "remote" now "tok-two" "id-two")]
+        (is (:ok r3))
+        (is (= :two (:table-type (:value r3))))))
+    (testing "历史 large 票仍可正常叫号、入座（配置快照）"
+      (let [r4 (d/call-next s2 :large now)
+            s4 (:state r4)]
+        (is (:ok r4))
+        (is (= "id-large" (:id (:value r4))))
+        (is (= :called (get-in s4 [:tickets "id-large" :status])))
+        (let [r5 (d/seat s4 :large "id-large" now)]
+          (is (:ok r5))
+          (is (= :seated (get-in (:state r5) [:tickets "id-large" :status]))))))
+    (testing "历史 large 队列仍可被查看"
+      (is (= ["id-large"] (:waiting (d/queue-view s2 :large)))))))
+
 (deftest query-operations
   (let [ops [{:seq 0 :ts 100 :actor :customer :action :create-ticket :target {:kind :ticket :id "a"}}
              {:seq 1 :ts 200 :actor :staff :action :call :target {:kind :ticket :id "a"}}
