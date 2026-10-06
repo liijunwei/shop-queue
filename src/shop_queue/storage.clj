@@ -30,6 +30,16 @@
                      data TEXT NOT NULL,
                      PRIMARY KEY (store_id, seq))"])
   (jdbc/execute! ds
+                 ["CREATE TABLE IF NOT EXISTS counters (
+                     store_id TEXT NOT NULL,
+                     table_type TEXT NOT NULL,
+                     counter INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (store_id, table_type))"])
+  (jdbc/execute! ds
+                 ["CREATE TABLE IF NOT EXISTS tokens (
+                     token TEXT PRIMARY KEY,
+                     store_id TEXT NOT NULL)"])
+  (jdbc/execute! ds
                  ["CREATE TABLE IF NOT EXISTS healthz (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL)"])
   ds)
 
@@ -56,6 +66,37 @@
                  ["INSERT INTO stores (store_id, data) VALUES (?, ?)
       ON CONFLICT(store_id) DO UPDATE SET data = excluded.data"
                   store-id (pr-str store)]))
+
+(defn next-counter!
+  "Atomically allocate the next sequential number for one store/table-type
+  queue. `current` is the counter recorded in the store document. The single
+  UPSERT first raises the stored counter to at least `current + 1`, then on
+  conflict increments the existing value, and `RETURNING` hands back the result.
+  This is one atomic SQLite statement, so concurrent callers get distinct,
+  gap-free numbers without relying on an application lock."
+  [ds store-id table-type current]
+  (-> (jdbc/execute! ds
+        ["INSERT INTO counters (store_id, table_type, counter) VALUES (?, ?, ?)
+          ON CONFLICT(store_id, table_type) DO UPDATE SET
+            counter = MAX(counters.counter + 1, excluded.counter)
+          RETURNING counter"
+         store-id (name table-type) (inc (long current))]
+        {:builder-fn rs/as-unqualified-kebab-maps})
+      first
+      :counter))
+
+(defn claim-token!
+  "Claim `token` for `store-id`. The `tokens.token` primary key enforces global
+  uniqueness; return true when the token was newly claimed and false when it
+  already exists."
+  [ds store-id token]
+  (pos? (long (or (-> (jdbc/execute! ds
+                          ["INSERT INTO tokens (token, store_id) VALUES (?, ?)
+                            ON CONFLICT(token) DO NOTHING"
+                           token store-id])
+                      first
+                      :next.jdbc/update-count)
+                  0))))
 
 (defn append-operation!
   "Append one operation record to the append-only operations table and return
