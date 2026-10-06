@@ -186,6 +186,51 @@
         (is (= 404 (:status rc)))
         (is (= "not-found" (:error bc)))))))
 
+(deftest empty-queue-call-flow
+  (testing "空队列叫号返回 409 empty-queue，不落 500"
+    (let [r (post* (url "stores" "store-1" "queues" "two" "call"))
+          b (:body r)]
+      (is (= 409 (:status r)))
+      (is (= "empty-queue" (:error b))))))
+
+(deftest waiting-ticket-seat-rejected
+  (let [r1 (post-json (url "stores" "store-1" "tickets") {:party-size 2 :source "remote"})
+        id (:id (:body r1))]
+    (is (= 201 (:status r1)))
+    (let [r2 (post* (url "stores" "store-1" "queues" "two" "tickets" id "seat"))
+          b2 (:body r2)]
+      (is (= 409 (:status r2)))
+      (is (= "invalid-transition" (:error b2))))))
+
+(deftest seated-ticket-transition-rejected
+  (let [r1 (post-json (url "stores" "store-1" "tickets") {:party-size 2 :source "remote"})
+        id (:id (:body r1))]
+    (is (= 201 (:status r1)))
+    (is (= id (:id (:body (post* (url "stores" "store-1" "queues" "two" "call"))))))
+    (is (= 200 (:status (post* (url "stores" "store-1" "queues" "two" "tickets" id "seat")))))
+    (let [r2 (post* (url "stores" "store-1" "queues" "two" "tickets" id "no-show"))
+          b2 (:body r2)]
+      (is (= 409 (:status r2)))
+      (is (= "invalid-transition" (:error b2))))
+    (let [r3 (post* (url "stores" "store-1" "queues" "two" "tickets" id "seat"))
+          b3 (:body r3)]
+      (is (= 409 (:status r3)))
+      (is (= "invalid-transition" (:error b3))))))
+
+(deftest cancelled-ticket-transition-rejected
+  (let [r1 (post-json (url "stores" "store-1" "tickets") {:party-size 2 :source "remote"})
+        id (:id (:body r1))]
+    (is (= 201 (:status r1)))
+    (is (= 200 (:status (post* (url "stores" "store-1" "queues" "two" "tickets" id "cancel")))))
+    (let [r2 (post* (url "stores" "store-1" "queues" "two" "tickets" id "cancel"))
+          b2 (:body r2)]
+      (is (= 409 (:status r2)))
+      (is (= "invalid-transition" (:error b2))))
+    (let [r3 (post* (url "stores" "store-1" "queues" "two" "tickets" id "seat"))
+          b3 (:body r3)]
+      (is (= 409 (:status r3)))
+      (is (= "invalid-transition" (:error b3))))))
+
 (deftest idempotent-ticket-creation
   (testing "same idempotency-key returns the same ticket and does not advance the counter"
     (let [body {:party-size 2 :source "scan" :idempotency-key "qr-abc"}

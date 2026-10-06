@@ -116,6 +116,45 @@
       (testing "at most one called ticket per queue at any time"
         (is (= 1 (count (filter #(= :called (:status %)) (vals (:tickets s4))))))))))
 
+(deftest empty-queue-call
+  (testing "从未取号的空队列叫号返回 :empty-queue，而不是异常或空值"
+    (let [r (d/call-next (d/seed-store {}) :two now)]
+      (is (false? (:ok r)))
+      (is (= :empty-queue (get-in r [:error :code])))
+      (is (= "no waiting tickets" (get-in r [:error :message])))))
+  (testing "所有票都已处置后叫号仍返回 :empty-queue"
+    (let [s1 (:state (d/create-ticket {} 2 "remote" now "tok1" "id-1"))
+          s2 (:state (d/call-next s1 :two now))
+          s3 (:state (d/seat s2 :two "id-1" now))
+          r (d/call-next s3 :two now)]
+      (is (false? (:ok r)))
+      (is (= :empty-queue (get-in r [:error :code]))))))
+
+(deftest invalid-transitions-rejected
+  (let [s-waiting (:state (d/create-ticket {} 2 "remote" now "tok1" "id-1"))]
+    (testing "waiting 票必须先叫号，不能直接 seat/no-show"
+      (is (= :invalid-transition (get-in (d/seat s-waiting :two "id-1" now) [:error :code])))
+      (is (= :invalid-transition (get-in (d/no-show s-waiting :two "id-1" now) [:error :code])))))
+  (let [s-seated (-> (d/create-ticket {} 2 "remote" now "tok1" "id-1")
+                     :state
+                     (d/call-next :two now)
+                     :state
+                     (d/seat :two "id-1" now)
+                     :state)]
+    (testing "seated 是终态，不能再次 seat/no-show"
+      (is (= :invalid-transition (get-in (d/seat s-seated :two "id-1" now) [:error :code])))
+      (is (= :invalid-transition (get-in (d/no-show s-seated :two "id-1" now) [:error :code]))))
+    (testing "seated 票不能再 cancel"
+      (is (= :invalid-transition (get-in (d/cancel s-seated :two "id-1") [:error :code])))))
+  (let [s-cancelled (-> (d/create-ticket {} 2 "remote" now "tok1" "id-1")
+                        :state
+                        (d/cancel :two "id-1")
+                        :state)]
+    (testing "cancelled 是终态，不能再次 cancel/seat/no-show"
+      (is (= :invalid-transition (get-in (d/cancel s-cancelled :two "id-1") [:error :code])))
+      (is (= :invalid-transition (get-in (d/seat s-cancelled :two "id-1" now) [:error :code])))
+      (is (= :invalid-transition (get-in (d/no-show s-cancelled :two "id-1" now) [:error :code]))))))
+
 (deftest queue-open-close
   (let [r1 (d/close-queue {} :two)
         s1 (:state r1)]
