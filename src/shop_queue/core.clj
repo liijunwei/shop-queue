@@ -1,7 +1,10 @@
 (ns shop-queue.core
-  (:gen-class))
+  (:gen-class)
+  (:require [shop-queue.api :as api]))
 
 (defn -main
-  "I don't do a whole lot ... yet."
-  [& args]
-  (println "Hello, World!"))
+  [& _]
+  (api/start! 3000)
+  (println "shop-queue listening on http://localhost:3000")
+  (flush)
+  @(promise))
