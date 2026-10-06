@@ -1,44 +1,22 @@
 # shop-queue
 
-FIXME: description
+最小闭环的「门店排队取号」Clojure 原型。顾客远程/扫码取号并轮询或订阅 SSE，员工叫号/入座/过号/取消，SQLite 全量持久化。
 
-## Installation
+## 运行
 
-Download from https://example.com/FIXME.
+```bash
+QUEUE_DB=queue.db PORT=8080 lein run
+```
 
-## Usage
+## 测试
 
-FIXME: explanation
+```bash
+lein test
+```
 
-    $ java -jar shop-queue-0.1.0-standalone.jar [args]
+## 模块
 
-## Options
-
-FIXME: listing of options this app accepts.
-
-## Examples
-
-...
-
-### Bugs
-
-...
-
-### Any Other Sections
-### That You Think
-### Might be Useful
-
-## License
-
-Copyright © 2026 FIXME
-
-This program and the accompanying materials are made available under the
-terms of the Eclipse Public License 2.0 which is available at
-https://www.eclipse.org/legal/epl-2.0.
-
-This Source Code may also be made available under the following Secondary
-Licenses when the conditions for such availability set forth in the Eclipse
-Public License, v. 2.0 are satisfied: GNU General Public License as published by
-the Free Software Foundation, either version 2 of the License, or (at your
-option) any later version, with the GNU Classpath Exception which is available
-at https://www.gnu.org/software/classpath/license.html.
+- `domain.clj` — 纯函数：状态机、桌型匹配、派生视图、`diff-events`。
+- `storage.clj` — SQLite，每店一条 EDN 文档。
+- `api.clj` — http-kit 路由 + SSE 订阅注册表（IO 边界）。
+- `core.clj` — 入口。

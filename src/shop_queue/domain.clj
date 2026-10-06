@@ -1,135 +1,209 @@
-(ns shop-queue.domain)
+(ns shop-queue.domain
+  "Pure domain functions for the shop queue. State is ordinary immutable data;
+  every command returns either {:ok true :state new-store :value ...} or
+  {:ok false :error {:code .. :message ..}}. No IO happens here.")
 
-;; State is plain data (DOP): a map of stores -> table types / queues / tickets.
-;; All functions here are pure: they take a state map and return a new one.
-
-(def table-types
-  {:two   {:label "2人" :prefix "A" :min 2 :max 2}
-   :three {:label "3人" :prefix "B" :min 3 :max 3}
+(def default-table-types
+  {:two   {:label "2人"  :prefix "A" :min 2 :max 2}
+   :three {:label "3人"  :prefix "B" :min 3 :max 3}
    :large {:label "多人" :prefix "C" :min 4 :max nil}})
 
-(defn err [status code msg]
-  (ex-info msg {:status status :code code}))
+(def max-party-size 50)
+(def valid-sources #{"remote" "scan"})
 
-(defn default-state []
-  {:stores
-   {"store-1"
-    {:table-types table-types
-     :queues {:two   {:status :open :counter 0 :order []}
-              :three {:status :open :counter 0 :order []}
-              :large {:status :open :counter 0 :order []}}
-     :tickets {}
-     :by-token {}}}})
+(defn- ok [state value] {:ok true :state state :value value})
+(defn- err [code message] {:ok false :error {:code code :message message}})
 
-(defn pick-table-type [size]
+(defn valid-party-size? [n]
+  (and (integer? n) (pos? n)))
+
+(defn ticket-id [prefix n]
+  (str prefix (format "%03d" n)))
+
+;; Ensure a store carries every configured table-type queue plus a :tickets map.
+(defn seed-store
+  ([] (seed-store {}))
+  ([store]
+   (let [table-types (merge default-table-types (:table-types store))
+         queues (into {}
+                      (map (fn [[tt _]]
+                             [tt (merge {:status :open :counter 0}
+                                        (get-in store [:queues tt]))])
+                           table-types))]
+     (-> store
+         (assoc :table-types table-types)
+         (assoc :queues queues)
+         (update :tickets #(or % {}))))))
+
+;; Smallest capacity that can seat n; :max nil means no upper bound.
+(defn match-table-type [table-types n]
   (->> table-types
-       (filter (fn [[_ tt]] (or (nil? (:max tt)) (<= size (:max tt)))))
-       (sort-by (fn [[_ tt]] (:min tt)))
+       (filter (fn [[_ {:keys [max]}]]
+                 (or (nil? max) (>= max n))))
+       (sort-by (fn [[_ {:keys [max]}]] (if (nil? max) Long/MAX_VALUE max)))
+       ffirst))
+
+;; ---- Derived views (single source of truth is :tickets + :n) ----
+
+(defn tickets-with-id [store]
+  (for [[id t] (:tickets store)] (assoc t :id id)))
+
+(defn waiting-tickets [store tt]
+  (->> (tickets-with-id store)
+       (filter #(and (= tt (:table-type %)) (= :waiting (:status %))))
+       (sort-by :n)))
+
+(defn current-called [store tt]
+  (->> (tickets-with-id store)
+       (filter #(and (= tt (:table-type %)) (= :called (:status %))))
        first))
 
-(defn take-ticket [state store-id party-size source]
-  (let [store (get-in state [:stores store-id])]
-    (when-not store (throw (err 404 :store-not-found "store not found")))
-    (let [[tt-k tt-v] (pick-table-type party-size)]
-      (when-not tt-k (throw (err 400 :unsupported-party-size "no table type fits this party size")))
-      (let [q (get-in store [:queues tt-k])]
-        (when-not (= :open (:status q)) (throw (err 409 :queue-closed "queue is closed")))
-        (let [counter (inc (:counter q))
-              number (str (:prefix tt-v) (format "%03d" counter))
-              token (str (java.util.UUID/randomUUID))
-              ticket {:id number
-                      :token token
-                      :table-type tt-k
-                      :party-size party-size
-                      :source source
-                      :status :waiting
-                      :created-at (System/currentTimeMillis)
-                      :called-at nil}
-              new-state (-> state
-                            (assoc-in [:stores store-id :queues tt-k :counter] counter)
-                            (update-in [:stores store-id :queues tt-k :order] conj number)
-                            (assoc-in [:stores store-id :tickets number] ticket)
-                            (assoc-in [:stores store-id :by-token token] number))]
-          {:state new-state :ticket ticket})))))
+(defn parties-ahead [store tt n]
+  (count (filter #(and (= tt (:table-type %))
+                       (= :waiting (:status %))
+                       (< (:n %) n))
+                 (vals (:tickets store)))))
 
-(defn call-next [state store-id tt-k]
-  (let [store (get-in state [:stores store-id])]
-    (when-not store (throw (err 404 :store-not-found "store not found")))
-    (let [q (get-in store [:queues tt-k])]
-      (when-not q (throw (err 404 :table-type-not-found "table type not found")))
-      (let [ticket-id (->> (:order q)
-                           (filter #(= :waiting (get-in store [:tickets % :status])))
-                           first)]
-        (if-not ticket-id
-          {:state state :ticket nil}
-          (let [now (System/currentTimeMillis)
-                new-state (-> state
-                              (assoc-in [:stores store-id :tickets ticket-id :status] :called)
-                              (assoc-in [:stores store-id :tickets ticket-id :called-at] now))]
-            {:state new-state
-             :ticket (get-in new-state [:stores store-id :tickets ticket-id])}))))))
+(defn ticket-by-token [store token]
+  (->> (tickets-with-id store)
+       (filter #(= token (:token %)))
+       first))
 
-(defn- transition-ticket [state store-id ticket-id from to]
-  (let [store (get-in state [:stores store-id])
-        ticket (get-in store [:tickets ticket-id])]
-    (when-not store (throw (err 404 :store-not-found "store not found")))
-    (when-not ticket (throw (err 404 :ticket-not-found "ticket not found")))
-    (when-not (= from (:status ticket))
-      (throw (err 409 :invalid-transition (str "ticket is " (name (:status ticket))))))
-    (let [new-state (assoc-in state [:stores store-id :tickets ticket-id :status] to)]
-      {:state new-state
-       :ticket (get-in new-state [:stores store-id :tickets ticket-id])})))
+;; ---- Commands ----
 
-(defn seat [state store-id ticket-id] (transition-ticket state store-id ticket-id :called :seated))
-(defn no-show [state store-id ticket-id] (transition-ticket state store-id ticket-id :called :no-show))
-(defn cancel [state store-id ticket-id] (transition-ticket state store-id ticket-id :waiting :cancelled))
+(defn create-ticket [store party-size source now token]
+  (let [store (seed-store store)
+        tt (match-table-type (:table-types store) party-size)]
+    (cond
+      (not (valid-party-size? party-size))
+      (err :invalid-party-size "party-size must be a positive integer")
 
-(defn set-queue-status [state store-id tt-k status]
-  (let [store (get-in state [:stores store-id])]
-    (when-not store (throw (err 404 :store-not-found "store not found")))
-    (when-not (get-in store [:queues tt-k]) (throw (err 404 :table-type-not-found "table type not found")))
-    (let [new-state (assoc-in state [:stores store-id :queues tt-k :status] status)]
-      {:state new-state
-       :queue (get-in new-state [:stores store-id :queues tt-k])})))
+      (> party-size max-party-size)
+      (err :party-size-too-large (str "party-size exceeds " max-party-size))
 
-(defn status-by-token [state store-id token]
-  (let [store (get-in state [:stores store-id])]
-    (when-not store (throw (err 404 :store-not-found "store not found")))
-    (let [ticket-id (get-in store [:by-token token])]
-      (when-not ticket-id (throw (err 404 :ticket-not-found "token not found")))
-      (let [ticket (get-in store [:tickets ticket-id])
-            tt (:table-type ticket)
-            order (get-in store [:queues tt :order])
-            pos (count (take-while #(not= ticket-id %) order))
-            parties-ahead (count (filter #(= :waiting (get-in store [:tickets % :status]))
-                                         (take pos order)))
-            current-called (->> (reverse order)
-                                (filter #(contains? #{:called :seated :no-show}
-                                                    (get-in store [:tickets % :status])))
-                                first
-                                (#(get-in store [:tickets % :id])))]
-        {:number (:id ticket)
-         :token token
-         :table-type (name tt)
-         :label (get-in store [:table-types tt :label])
-         :party-size (:party-size ticket)
-         :status (:status ticket)
-         :parties-ahead parties-ahead
-         :current-called current-called}))))
+      (not (contains? valid-sources source))
+      (err :invalid-source "source must be remote or scan")
 
-(defn ticket-view [ticket]
-  {:number (:id ticket)
-   :party-size (:party-size ticket)
-   :source (:source ticket)
-   :status (:status ticket)})
+      (nil? tt)
+      (err :no-matching-table-type "party-size exceeds every table size")
 
-(defn list-queue [state store-id tt-k]
-  (let [store (get-in state [:stores store-id])]
-    (when-not store (throw (err 404 :store-not-found "store not found")))
-    (let [tt-v (get-in store [:table-types tt-k])
-          q (get-in store [:queues tt-k])]
-      (when-not tt-v (throw (err 404 :table-type-not-found "table type not found")))
-      {:table-type (name tt-k)
-       :label (:label tt-v)
-       :status (:status q)
-       :tickets (mapv #(ticket-view (get-in store [:tickets %])) (:order q))})))
+      (= :closed (get-in store [:queues tt :status]))
+      (err :queue-closed "queue is closed")
+
+      :else
+      (let [n (inc (long (get-in store [:queues tt :counter] 0)))
+            id (ticket-id (:prefix (get-in store [:table-types tt])) n)
+            ticket {:n n :token token :table-type tt :party-size party-size
+                    :source source :status :waiting :created-at now :called-at nil}
+            new-store (-> store
+                          (assoc-in [:queues tt :counter] n)
+                          (assoc-in [:tickets id] ticket))]
+        (ok new-store {:id id :token token :table-type tt :party-size party-size
+                       :parties-ahead (parties-ahead new-store tt n)})))))
+
+(defn call-next [store tt now]
+  (let [store (seed-store store)]
+    (cond
+      (not (contains? (:table-types store) tt))
+      (err :not-found "unknown table type")
+
+      (current-called store tt)
+      (err :ticket-in-flight (str "call " (:id (current-called store tt)) " first"))
+
+      (empty? (waiting-tickets store tt))
+      (err :empty-queue "no waiting tickets")
+
+      :else
+      (let [nxt (first (waiting-tickets store tt))
+            new-store (-> store
+                          (assoc-in [:tickets (:id nxt) :status] :called)
+                          (assoc-in [:tickets (:id nxt) :called-at] now))]
+        (ok new-store {:id (:id nxt) :token (:token nxt)})))))
+
+(defn- finalize [store tt id to-status]
+  (let [store (seed-store store)
+        t (get-in store [:tickets id])]
+    (cond
+      (nil? t) (err :not-found "ticket not found")
+      (not= tt (:table-type t)) (err :not-found "ticket not found")
+      (not= :called (:status t)) (err :invalid-transition "ticket is not called")
+      :else (ok (assoc-in store [:tickets id :status] to-status) {:id id}))))
+
+(defn seat [store tt id _now] (finalize store tt id :seated))
+(defn no-show [store tt id _now] (finalize store tt id :no-show))
+
+(defn cancel [store tt id]
+  (let [store (seed-store store)
+        t (get-in store [:tickets id])]
+    (cond
+      (nil? t) (err :not-found "ticket not found")
+      (not= tt (:table-type t)) (err :not-found "ticket not found")
+      (not= :waiting (:status t)) (err :invalid-transition "ticket is not waiting")
+      :else (ok (assoc-in store [:tickets id :status] :cancelled) {:id id}))))
+
+(defn set-queue-status [store tt status]
+  (let [store (seed-store store)]
+    (if (not (contains? (:table-types store) tt))
+      (err :not-found "unknown table type")
+      (ok (assoc-in store [:queues tt :status] status)
+          {:table-type tt :status status}))))
+
+(defn open-queue [store tt] (set-queue-status store tt :open))
+(defn close-queue [store tt] (set-queue-status store tt :closed))
+
+;; ---- Events as a pure projection of the value change ----
+
+(defn diff-events [old-store new-store]
+  (let [old-tickets (:tickets old-store)
+        new-tickets (:tickets new-store)
+        ids (into (set (keys old-tickets)) (keys new-tickets))
+        ticket-events
+        (for [id ids
+              :let [o (:status (get old-tickets id))
+                    n (:status (get new-tickets id))]
+              :when (and o n (not= o n))]
+          {:kind :ticket :type n :ticket-id id
+           :token (:token (get new-tickets id))
+           :table-type (:table-type (get new-tickets id))})
+        queue-events
+        (for [[tt new-q] (:queues new-store)
+              :let [old-q (get-in old-store [:queues tt])]
+              :when (and old-q (not= (:status old-q) (:status new-q)))]
+          {:kind :queue
+           :type (if (= :open (:status new-q)) :queue-open :queue-closed)
+           :table-type tt})]
+    (concat ticket-events queue-events)))
+
+;; ---- Read views for the API ----
+
+(defn ticket-status-view [store token]
+  (when-let [t (ticket-by-token store token)]
+    (let [tt (:table-type t)]
+      {:id (:id t)
+       :status (:status t)
+       :table-type tt
+       :party-size (:party-size t)
+       :source (:source t)
+       :parties-ahead (parties-ahead store tt (:n t))
+       :current-called (some-> (current-called store tt) :id)
+       :queue (get-in store [:queues tt :status])})))
+
+(defn queue-view [store tt]
+  (let [store (seed-store store)]
+    (when (contains? (:table-types store) tt)
+      {:table-type tt
+       :status (get-in store [:queues tt :status])
+       :counter (get-in store [:queues tt :counter])
+       :waiting (mapv :id (waiting-tickets store tt))
+       :current-called (some-> (current-called store tt) :id)})))
+
+(defn store-view [store]
+  (let [store (seed-store store)]
+    {:table-types (:table-types store)
+     :queues (into {}
+                   (map (fn [[tt q]]
+                          [tt {:status (:status q)
+                               :counter (:counter q)
+                               :waiting-count (count (waiting-tickets store tt))
+                               :current-called (some-> (current-called store tt) :id)}])
+                        (:queues store)))}))

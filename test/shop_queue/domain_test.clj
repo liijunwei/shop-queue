@@ -1,36 +1,89 @@
 (ns shop-queue.domain-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing]]
             [shop-queue.domain :as d]))
 
-(deftest take-maps-party-size-to-smallest-table
-  (let [s (d/default-state)
-        {:keys [state ticket]} (d/take-ticket s "store-1" 2 "remote")]
-    (is (= "A001" (:id ticket)))
-    (is (= :two (:table-type ticket)))
-    (is (= :waiting (:status ticket)))
-    (is (= 0 (:parties-ahead (d/status-by-token state "store-1" (:token ticket))))))
-  (let [s (d/default-state)
-        {:keys [ticket]} (d/take-ticket s "store-1" 4 "scan")]
-    (is (= :large (:table-type ticket)))))
+(def now 1700000000)
 
-(deftest parties-ahead-counts-waiting-tickets
-  (let [s (d/default-state)
-        r1 (d/take-ticket s "store-1" 2 "remote")
-        r2 (d/take-ticket (:state r1) "store-1" 2 "remote")]
-    (is (= 0 (:parties-ahead (d/status-by-token (:state r2) "store-1" (:token (:ticket r1))))))
-    (is (= 1 (:parties-ahead (d/status-by-token (:state r2) "store-1" (:token (:ticket r2))))))))
+(deftest table-type-matching
+  (is (= :two (d/match-table-type d/default-table-types 1)))
+  (is (= :two (d/match-table-type d/default-table-types 2)))
+  (is (= :three (d/match-table-type d/default-table-types 3)))
+  (is (= :large (d/match-table-type d/default-table-types 4)))
+  (is (= :large (d/match-table-type d/default-table-types 20)))
+  (is (nil? (d/match-table-type (dissoc d/default-table-types :large) 10))))
 
-(deftest call-next-and-transitions
-  (let [s (d/default-state)
-        {:keys [state]} (d/take-ticket s "store-1" 2 "remote")
-        {:keys [state ticket]} (d/call-next state "store-1" :two)]
-    (is (= "A001" (:id ticket)))
-    (is (= :called (:status ticket)))
-    (let [seated (d/seat state "store-1" "A001")]
-      (is (= :seated (:status (:ticket seated)))))))
+(deftest create-ticket
+  (let [r (d/create-ticket {} 2 "remote" now "tok1")]
+    (is (:ok r))
+    (is (= "A001" (:id (:value r))))
+    (is (= :two (:table-type (:value r))))
+    (is (= 0 (:parties-ahead (:value r))))
+    (is (= :waiting (get-in (:state r) [:tickets "A001" :status])))
+    (is (= 1 (get-in (:state r) [:queues :two :counter])))))
 
-(deftest closed-queue-rejects-new-ticket
-  (let [s (d/default-state)
-        {:keys [state]} (d/set-queue-status s "store-1" :two :closed)]
-    (is (thrown? clojure.lang.ExceptionInfo
-                 (d/take-ticket state "store-1" 2 "remote")))))
+(deftest create-ticket-validation
+  (is (not (:ok (d/create-ticket {} 0 "remote" now "t"))))
+  (is (not (:ok (d/create-ticket {} 51 "remote" now "t"))))
+  (is (not (:ok (d/create-ticket {} 2 "bogus" now "t"))))
+  (is (not (:ok (d/create-ticket {} 100 "remote" now "t")))))
+
+(deftest lifecycle
+  (let [r1 (d/create-ticket {} 2 "remote" now "tok1")
+        s1 (:state r1)
+        r2 (d/create-ticket s1 2 "scan" now "tok2")
+        s2 (:state r2)]
+    (is (= "A002" (:id (:value r2))))
+    (is (= 1 (:parties-ahead (:value r2))))
+
+    (let [r3 (d/call-next s2 :two now)
+          s3 (:state r3)]
+      (is (= "A001" (:id (:value r3))))
+      (is (= :called (get-in s3 [:tickets "A001" :status])))
+      (is (= "A001" (:id (d/current-called s3 :two))))
+      (is (not (:ok (d/call-next s3 :two now))))
+
+      (let [r4 (d/seat s3 :two "A001" now)
+            s4 (:state r4)]
+        (is (:ok r4))
+        (is (= :seated (get-in s4 [:tickets "A001" :status])))
+        (is (nil? (d/current-called s4 :two)))
+        (is (not (:ok (d/seat s4 :two "A001" now))))
+
+        (let [r5 (d/cancel s4 :two "A002")
+              s5 (:state r5)]
+          (is (:ok r5))
+          (is (= :cancelled (get-in s5 [:tickets "A002" :status])))
+          (is (not (:ok (d/call-next s5 :two now)))))))))
+
+(deftest queue-open-close
+  (let [r1 (d/close-queue {} :two)
+        s1 (:state r1)]
+    (is (= :closed (get-in s1 [:queues :two :status])))
+    (is (not (:ok (d/create-ticket s1 2 "remote" now "tok1"))))
+    (let [r2 (d/open-queue s1 :two)
+          s2 (:state r2)]
+      (is (= :open (get-in s2 [:queues :two :status])))
+      (is (:ok (d/create-ticket s2 2 "remote" now "tok1"))))
+    (let [r3 (d/close-queue s1 :two)]
+      (is (:ok r3))
+      (is (= :closed (get-in (:state r3) [:queues :two :status]))))))
+
+(deftest diff-events
+  (let [s0 {}
+        r1 (d/create-ticket s0 2 "remote" now "tok1")
+        s1 (:state r1)
+        r2 (d/call-next s1 :two now)
+        s2 (:state r2)
+        evts (d/diff-events s1 s2)]
+    (is (= 1 (count evts)))
+    (is (= :ticket (:kind (first evts))))
+    (is (= :called (:type (first evts))))
+    (is (= "A001" (:ticket-id (first evts))))
+    (is (= "tok1" (:token (first evts))))))
+
+(deftest ticket-by-token-and-view
+  (let [r (d/create-ticket {} 2 "remote" now "tok-x")
+        s (:state r)]
+    (is (= "A001" (:id (d/ticket-by-token s "tok-x"))))
+    (is (nil? (d/ticket-by-token s "nope")))
+    (is (= :waiting (:status (d/ticket-status-view s "tok-x"))))))

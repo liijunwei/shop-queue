@@ -5,7 +5,9 @@
             :url "https://www.eclipse.org/legal/epl-2.0/"}
   :dependencies [[org.clojure/clojure "1.12.2"]
                  [http-kit "2.8.0"]
-                 [cheshire "5.13.0"]]
+                 [cheshire "5.13.0"]
+                 [com.github.seancorfield/next.jdbc "1.3.883"]
+                 [org.xerial/sqlite-jdbc "3.43.0.0"]]
   :main ^:skip-aot shop-queue.core
   :target-path "target/%s"
   :profiles {:uberjar {:aot :all
