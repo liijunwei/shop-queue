@@ -13,7 +13,9 @@
             [org.httpkit.server :as http]
             [shop-queue.api :as api]
             [shop-queue.domain :as domain]
-            [shop-queue.storage :as storage]))
+            [shop-queue.storage :as storage])
+  (:import (java.io BufferedReader InputStreamReader)
+           (java.net HttpURLConnection URL)))
 
 (def ^:dynamic *server* nil)
 (def ^:dynamic *port* nil)
@@ -52,6 +54,34 @@
 (defn- uuid-string? [s]
   (boolean (try (java.util.UUID/fromString s) (catch Exception _ nil))))
 
+(defn- open-sse [full-url last-id]
+  (let [conn (doto (.openConnection (URL. full-url))
+               (.setRequestMethod "GET")
+               (.setRequestProperty "Accept" "text/event-stream")
+               (.setConnectTimeout 3000)
+               (.setReadTimeout 3000))]
+    (when last-id
+      (.setRequestProperty conn "Last-Event-ID" (str last-id)))
+    {:conn conn
+     :in (BufferedReader. (InputStreamReader. (.getInputStream conn) "UTF-8"))}))
+
+(defn- read-sse-event [rdr]
+  (try
+    (loop [event nil id nil data []]
+      (let [line (.readLine rdr)]
+        (cond
+          (nil? line) ::eof
+          (str/blank? line) {:event event :id id :data (str/join "\n" data)}
+          (str/starts-with? line "event:") (recur (str/trim (subs line 6)) id data)
+          (str/starts-with? line "id:") (recur event (str/trim (subs line 3)) data)
+          (str/starts-with? line "data:") (recur event id (conj data (subs line 5)))
+          :else (recur event id data))))
+    (catch java.net.SocketTimeoutException _ ::timeout)))
+
+(defn- close-sse [sse]
+  (try (.close ^java.io.Closeable (:in sse)) (catch Exception _))
+  (try (.disconnect ^HttpURLConnection (:conn sse)) (catch Exception _)))
+
 (defn with-test-server [f]
   (let [db-path (str (io/file (System/getProperty "java.io.tmpdir")
                               (str "shop-queue-it-" (java.util.UUID/randomUUID) ".db")))
@@ -59,7 +89,8 @@
         state (atom {:stores {"store-1" (domain/seed-store {})
                               "store-2" (domain/seed-store {})}})
         subs (atom {:by-token {} :by-table-type {}})
-        system {:db ds :state state :subs subs}
+        events (atom {:seq 0 :by-token {}})
+        system {:db ds :state state :subs subs :events events}
         server (http/run-server (api/handler system) {:port 0 :legacy-return-value? false})]
     (binding [*server* server
               *port* (http/server-port server)
@@ -520,5 +551,42 @@
     (is (= "some-ticket-id" (:ticket-id log)))
     (is (= 404 (:status log)))
     (is (number? (:duration-ms log)))))
+
+(deftest sse-events-carry-seq-and-reconnect-recovers-state
+  (let [created (post-json (url "stores" "store-1" "tickets") {:party-size 2 :source "remote"})
+        ticket (:body created)
+        token (:token ticket)
+        sse-url (str "http://127.0.0.1:" *port* "/stores/store-1/events/" token)]
+    (is (= 201 (:status created)))
+    (let [c1 (open-sse sse-url nil)
+          snap1 (read-sse-event (:in c1))]
+      (testing "初始订阅先收到权威 snapshot，seq 从 0 开始"
+        (is (= "snapshot" (:event snap1)))
+        (let [s1 (json/parse-string (:data snap1) true)]
+          (is (= "waiting" (:status s1)))
+          (is (= 0 (:seq s1)))
+          (is (nil? (:last-event-id s1)))))
+      (testing "实时事件带单调递增 seq（snapshot 0 -> called 1）"
+        (is (= 200 (:status (post* (url "stores" "store-1" "queues" "two" "call")))))
+        (let [called (read-sse-event (:in c1))
+              cdata (json/parse-string (:data called) true)]
+          (is (= "called" (:event called)))
+          (is (= "1" (:id called)))
+          (is (= 1 (:seq cdata)))))
+      (close-sse c1)
+      (testing "断线期间的状态变化在重连时被补上（Last-Event-ID 续传 + snapshot 兜底）"
+        (is (= 200 (:status (post* (url "stores" "store-1" "queues" "two" "tickets" (:id ticket) "seat")))))
+        (let [c2 (open-sse sse-url "1")
+              replayed (read-sse-event (:in c2))
+              snap2 (read-sse-event (:in c2))]
+          (is (= "seated" (:event replayed)))
+          (is (= "2" (:id replayed)))
+          (is (= 2 (:seq (json/parse-string (:data replayed) true))))
+          (is (= "snapshot" (:event snap2)))
+          (let [s2 (json/parse-string (:data snap2) true)]
+            (is (= "seated" (:status s2)))
+            (is (= 2 (:seq s2)))
+            (is (= 1 (:last-event-id s2))))
+          (close-sse c2))))))
 
 (comment (full-store-queue-flow))

@@ -14,6 +14,27 @@ QUEUE_DB=queue.db PORT=8080 lein run
 lein test
 ```
 
+## 实时推送与断线重连
+
+顾客号状态有两个获取渠道，**状态以轮询 / 快照为准，SSE 只做提醒**：
+
+- `GET /stores/{store}/tickets/{token}`：权威查询，返回完整状态
+  （`status`、`parties-ahead`、`current-called` 等）。
+- `GET /stores/{store}/events/{token}`：SSE 订阅，连接建立后先发一条
+  `snapshot` 事件（含当前权威状态与 `seq`），随后推送该号的
+  `called / seated / no-show / cancelled` 事件。
+
+每个 SSE 事件都带全局单调递增的 `seq`（同时写入 SSE 的 `id:` 字段，便于
+浏览器自动回传 `Last-Event-ID`）。客户端断线重连时：
+
+1. 先 `GET /stores/{store}/tickets/{token}` 拿一次权威状态；
+2. 再重新订阅 SSE，并带上 `Last-Event-ID: <上次收到的 seq/id>`。
+
+服务端会在重连时先重放 `seq` 大于 `Last-Event-ID` 的该号事件（最多重放最近
+100 条，更早的由 snapshot 覆盖），随后照常发一条 `snapshot`。因为 snapshot
+始终反映最新权威状态，即使事件有缺口或重放不完整，客户端也以
+snapshot / GET 的值为准，不会出现轮询与推送两端不一致。
+
 ## 备份与恢复
 
 数据库是单个 SQLite 文件（WAL 模式）。边写边复制文件会得到不一致的副本，所以用
@@ -58,6 +79,6 @@ QUEUE_DB=queue.db BACKUP_DIR=backups lein run -m shop-queue.backup
 
 - `domain.clj` — 纯函数：状态机、桌型匹配、派生视图、`diff-events`。
 - `storage.clj` — SQLite，每店一条 EDN 文档。
-- `api.clj` — http-kit 路由 + SSE 订阅注册表（IO 边界）。
+- `api.clj` — http-kit 路由 + SSE 订阅注册表 + 事件 seq / 重放（IO 边界）。
 - `core.clj` — 入口（启动加载与失败守护）。
 - `backup.clj` — `VACUUM INTO` 备份命令。

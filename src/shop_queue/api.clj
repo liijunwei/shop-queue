@@ -9,6 +9,11 @@
 
 (def write-lock (Object.))
 
+(def max-event-log
+  "Bounded per-token SSE replay history. Missed events older than this window
+  are covered by the authoritative snapshot, not by replay."
+  100)
+
 (defn- now-ms [] (System/currentTimeMillis))
 
 (defn- json-response [status body]
@@ -90,22 +95,48 @@
 (defn- unsubscribe! [subs kind key ch]
   (swap! subs update-in [kind key] (fnil disj #{}) ch))
 
-(defn- sse-frame [event-type data]
+(defn- sse-frame [event-type id data]
   (str "event: " (name event-type) "\n"
+       "id: " id "\n"
        "data: " (json/generate-string data) "\n\n"))
 
-(defn- send-event! [ch event-type data]
-  (http/send! ch (sse-frame event-type data) false))
+(defn- send-event! [ch id event-type data]
+  (http/send! ch (sse-frame event-type id data) false))
 
-(defn- publish-event! [subs ev]
-  (case (:kind ev)
-    :ticket (doseq [ch (get-in @subs [:by-token (:token ev)])]
-              (send-event! ch (:type ev)
-                {:type (:type ev) :ticket-id (:ticket-id ev) :table-type (:table-type ev)}))
-    :queue (doseq [ch (get-in @subs [:by-table-type (:table-type ev)])]
-             (send-event! ch (:type ev)
-               {:type (:type ev) :table-type (:table-type ev)}))
-    nil))
+(defn- next-seq!
+  "Advance and return the process-wide monotonic SSE sequence number. The
+  sequence is global (not per ticket) so ordering is total and gaps are
+  allowed; a ticket stream only needs monotonicity."
+  [events]
+  (:seq (swap! events update :seq inc)))
+
+(defn- remember-event! [events token ev]
+  (swap! events update-in [:by-token token]
+         (fn [log] (vec (take-last max-event-log (conj (or log []) ev))))))
+
+(defn- current-seq [events] (:seq @events))
+
+(defn- replay-frames [events token last-id]
+  (when last-id
+    (->> (get-in @events [:by-token token])
+         (filter #(> (:seq %) last-id))
+         (mapv (fn [ev] (sse-frame (:type ev) (:seq ev) ev))))))
+
+(defn- publish-event! [system ev]
+  (let [{:keys [events subs]} system]
+    (case (:kind ev)
+      :ticket
+      (let [seq (next-seq! events)
+            payload {:seq seq :type (:type ev) :ticket-id (:ticket-id ev) :table-type (:table-type ev)}]
+        (remember-event! events (:token ev) payload)
+        (doseq [ch (get-in @subs [:by-token (:token ev)])]
+          (send-event! ch seq (:type ev) payload)))
+      :queue
+      (let [seq (next-seq! events)
+            payload {:seq seq :type (:type ev) :table-type (:table-type ev)}]
+        (doseq [ch (get-in @subs [:by-table-type (:table-type ev)])]
+          (send-event! ch seq (:type ev) payload)))
+      nil)))
 
 ;; ---- State access + write path ----
 
@@ -145,7 +176,7 @@
         (storage/save-store! (:db system) store-id (:state result))
         (swap! (:state system) assoc-in [:stores store-id] (:state result))
         (doseq [ev (domain/diff-events old-store (:state result))]
-          (publish-event! (:subs system) ev)))
+          (publish-event! system ev)))
       (when op
         (when-let [record (op result)]
           (storage/append-operation! (:db system) store-id record)))
@@ -173,7 +204,7 @@
             (storage/save-store! (:db system) store-id new-store)
             (swap! (:state system) assoc-in [:stores store-id] new-store)
             (doseq [ev (domain/diff-events old-store new-store)]
-              (publish-event! (:subs system) ev))
+              (publish-event! system ev))
             (let [record ((op :customer token :create-ticket
                               (fn [r] (when-not (:duplicate (:value r))
                                         {:kind :ticket :id (:id (:value r))})))
@@ -316,13 +347,23 @@
       (http/as-channel req
         {:on-open (fn [ch]
                     (subscribe! (:subs system) :by-token token ch)
-                    (http/send! ch
-                      {:status 200
-                       :headers {"Content-Type" "text/event-stream; charset=utf-8"
-                                 "Cache-Control" "no-cache"
-                                 "Connection" "keep-alive"}
-                       :body (sse-frame :snapshot (domain/ticket-status-view store token))}
-                      false))
+                    (let [store (get-store system store-id)
+                          events (:events system)
+                          last-id (parse-long-str (get-in req [:headers "last-event-id"]))
+                          seq (current-seq events)
+                          replay (replay-frames events token last-id)
+                          snapshot-data (assoc (domain/ticket-status-view store token)
+                                               :seq seq
+                                               :last-event-id last-id)
+                          body (str (apply str replay)
+                                    (sse-frame :snapshot seq snapshot-data))]
+                      (http/send! ch
+                        {:status 200
+                         :headers {"Content-Type" "text/event-stream; charset=utf-8"
+                                   "Cache-Control" "no-cache"
+                                   "Connection" "keep-alive"}
+                         :body body}
+                        false)))
          :on-close (fn [ch _status]
                      (unsubscribe! (:subs system) :by-token token ch))}))
     (not-found "ticket not found")))

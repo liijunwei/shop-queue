@@ -19,7 +19,9 @@
                                       stores)})]
         (doseq [[id store] (:stores @state)]
           (storage/save-store! ds id store))
-        {:db ds :state state :subs (atom {:by-token {} :by-table-type {}})})
+        {:db ds :state state
+         :subs (atom {:by-token {} :by-table-type {}})
+         :events (atom {:seq 0 :by-token {}})})
       (catch Exception e
         (throw (ex-info (str "failed to load store state from " (pr-str db-path)
                              "; refusing to start with empty state")
