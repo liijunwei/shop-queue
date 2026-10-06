@@ -18,16 +18,28 @@
 (defn valid-party-size? [n]
   (and (integer? n) (pos? n)))
 
-;; Ensure a store carries every configured table-type queue plus a :tickets map.
+(defn- live-queue-types
+  "Every table type that still has a live queue: the configured types plus any
+  type still referenced by an issued ticket. Removing a type from configuration
+  must not orphan its already-issued tickets (config-snapshot semantics)."
+  [store]
+  (into (set (keys (:table-types store)))
+        (map :table-type (vals (or (:tickets store) {})))))
+
+;; Ensure a store carries a queue for every live table type plus a :tickets map.
+;; `:table-types` is authoritative once present: configuration changes must not
+;; be silently undone by re-merging the defaults.
 (defn seed-store
   ([] (seed-store {}))
   ([store]
-   (let [table-types (merge default-table-types (:table-types store))
+   (let [table-types (if (map? (:table-types store))
+                       (:table-types store)
+                       default-table-types)
          queues (into {}
-                      (map (fn [[tt _]]
+                      (map (fn [tt]
                              [tt (merge {:status :open :counter 0}
                                         (get-in store [:queues tt]))])
-                           table-types))]
+                           (live-queue-types (assoc store :table-types table-types))))]
      (-> store
          (assoc :table-types table-types)
          (assoc :queues queues)
@@ -45,6 +57,18 @@
                  (or (nil? max) (>= max n))))
        (sort-by (fn [[_ {:keys [min]}]] min))
        ffirst))
+
+(defn set-table-types
+  "Replace the table-type configuration. This is a pure configuration change:
+  it only affects which type future create-ticket requests match to. Tickets
+  already issued keep their recorded :table-type and continue to be called /
+  seated normally (config-snapshot semantics)."
+  [store table-types]
+  (if (map? table-types)
+    (let [store (seed-store store)]
+      (ok (seed-store (assoc store :table-types table-types))
+          {:table-types table-types}))
+    (err :invalid-table-types "table-types must be a map")))
 
 ;; ---- Derived views (single source of truth is :tickets + :n) ----
 
@@ -159,7 +183,7 @@
 (defn call-next [store tt now]
   (let [store (seed-store store)]
     (cond
-      (not (contains? (:table-types store) tt))
+      (not (contains? (:queues store) tt))
       (err :not-found "unknown table type")
 
       (= :drained (get-in store [:queues tt :status]))
@@ -234,7 +258,7 @@
 
 (defn set-queue-status [store tt status]
   (let [store (seed-store store)]
-    (if (not (contains? (:table-types store) tt))
+    (if (not (contains? (:queues store) tt))
       (err :not-found "unknown table type")
       (ok (assoc-in store [:queues tt :status] status)
           {:table-type tt :status status}))))
@@ -248,7 +272,7 @@
   [store tt]
   (let [store (seed-store store)]
     (cond
-      (not (contains? (:table-types store) tt))
+      (not (contains? (:queues store) tt))
       (err :not-found "unknown table type")
 
       :else
@@ -309,7 +333,7 @@
 
 (defn queue-view [store tt]
   (let [store (seed-store store)]
-    (when (contains? (:table-types store) tt)
+    (when (contains? (:queues store) tt)
       {:table-type tt
        :status (get-in store [:queues tt :status])
        :counter (get-in store [:queues tt :counter])
