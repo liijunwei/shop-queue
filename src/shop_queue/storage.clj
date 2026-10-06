@@ -1,7 +1,13 @@
 (ns shop-queue.storage
   "SQLite-backed storage. The whole store map is serialized as EDN into a single
   document row per store, so the persisted value is a 1:1 image of the domain
-  value (keywords and strings round-trip faithfully)."
+  value (keywords and strings round-trip faithfully).
+
+  No SQL JOINs: one row per store, assembled in memory. When a store's document
+  grows too large, split into normalized tables (tickets / queues / table_types)
+  and load with separate per-store SELECTs, still assembling the store map in
+  memory -- never a JOIN. `domain.clj` only sees the assembled map, so this swap
+  stays inside `load`/`save-store!`."
   (:require [clojure.edn :as edn]
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]))
