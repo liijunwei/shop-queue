@@ -80,3 +80,11 @@
           {:builder-fn rs/as-unqualified-kebab-maps})
        (mapv (fn [{:keys [store-id seq data]}]
                (assoc (edn/read-string data) :store-id store-id :seq seq)))))
+
+(defn backup!
+  "Take a consistent, point-in-time snapshot of the whole SQLite database into
+  `dest` using SQLite's VACUUM INTO. The destination must not already exist.
+  Returns `dest` on success and throws on any failure."
+  [ds dest]
+  (jdbc/execute! ds ["VACUUM INTO ?" (str dest)])
+  dest)
