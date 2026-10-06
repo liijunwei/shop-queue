@@ -82,50 +82,79 @@
      :party-size (:party-size t)
      :parties-ahead (parties-ahead store tt (:n t))}))
 
+(defn ticket-plan
+  "Decide what a create-ticket request should do without consuming a counter
+  number. Returns {:kind :error :error m}, {:kind :duplicate :ticket t}, or
+  {:kind :new :table-type tt}. This lets the API layer allocate the next number
+  from storage only when a new ticket will actually be created."
+  [store party-size source idempotency-key]
+  (let [store (seed-store store)
+        existing (when idempotency-key
+                   (when-let [existing-id (get-in store [:idempotency idempotency-key])]
+                     (when-let [t (get-in store [:tickets existing-id])]
+                       (assoc t :id existing-id))))]
+    (cond
+      (not (valid-party-size? party-size))
+      {:kind :error :error (err :invalid-party-size "party-size must be a positive integer")}
+
+      (> party-size max-party-size)
+      {:kind :error :error (err :party-size-too-large (str "party-size exceeds " max-party-size))}
+
+      (not (contains? valid-sources source))
+      {:kind :error :error (err :invalid-source "source must be remote or scan")}
+
+      existing
+      {:kind :duplicate :ticket existing}
+
+      :else
+      (let [tt (match-table-type (:table-types store) party-size)]
+        (cond
+          (nil? tt)
+          {:kind :error :error (err :no-matching-table-type "party-size exceeds every table size")}
+
+          (not= :open (get-in store [:queues tt :status]))
+          {:kind :error :error (err :queue-closed "queue is closed")}
+
+          :else
+          {:kind :new :table-type tt})))))
+
+(defn- build-new-ticket [store n party-size source now token id idempotency-key tt]
+  (let [ticket {:n n :token token :table-type tt :party-size party-size
+                :source source :status :waiting :created-at now :called-at nil}
+        new-store (-> store
+                      (assoc-in [:queues tt :counter] n)
+                      (assoc-in [:tickets id] ticket)
+                      (cond-> idempotency-key
+                        (assoc-in [:idempotency idempotency-key] id)))]
+    (ok new-store (ticket-create-value new-store (assoc ticket :id id)))))
+
 (defn create-ticket
   "Create a ticket. When a non-nil `idempotency-key` has already been used in
   this store, return the existing ticket unchanged and flag the replay with
-  :duplicate true; state is left untouched."
+  :duplicate true; state is left untouched.
+
+  The 8-arity form takes the next sequential number `n` already allocated by
+  the storage layer, keeping the counter allocation atomic and outside the pure
+  domain; the shorter arities derive `n` from the store counter for pure use."
   ([store party-size source now token id]
    (create-ticket store party-size source now token id nil))
   ([store party-size source now token id idempotency-key]
    (let [store (seed-store store)
-         existing (when idempotency-key
-                    (when-let [existing-id (get-in store [:idempotency idempotency-key])]
-                      (when-let [t (get-in store [:tickets existing-id])]
-                        (assoc t :id existing-id))))]
-     (cond
-       (not (valid-party-size? party-size))
-       (err :invalid-party-size "party-size must be a positive integer")
-
-       (> party-size max-party-size)
-       (err :party-size-too-large (str "party-size exceeds " max-party-size))
-
-       (not (contains? valid-sources source))
-       (err :invalid-source "source must be remote or scan")
-
-       existing
-       (ok store (assoc (ticket-create-value store existing) :duplicate true))
-
-       :else
-       (let [tt (match-table-type (:table-types store) party-size)]
-         (cond
-           (nil? tt)
-           (err :no-matching-table-type "party-size exceeds every table size")
-
-           (not= :open (get-in store [:queues tt :status]))
-           (err :queue-closed "queue is closed")
-
-           :else
-           (let [n (inc (long (get-in store [:queues tt :counter] 0)))
-                 ticket {:n n :token token :table-type tt :party-size party-size
-                         :source source :status :waiting :created-at now :called-at nil}
-                 new-store (-> store
-                               (assoc-in [:queues tt :counter] n)
-                               (assoc-in [:tickets id] ticket)
-                               (cond-> idempotency-key
-                                 (assoc-in [:idempotency idempotency-key] id)))]
-             (ok new-store (ticket-create-value new-store (assoc ticket :id id))))))))))
+         plan (ticket-plan store party-size source idempotency-key)]
+     (case (:kind plan)
+       :error (:error plan)
+       :duplicate (ok store (assoc (ticket-create-value store (:ticket plan)) :duplicate true))
+       :new (let [tt (:table-type plan)
+                  n (inc (long (get-in store [:queues tt :counter] 0)))]
+              (build-new-ticket store n party-size source now token id idempotency-key tt)))))
+  ([store party-size source now token id idempotency-key n]
+   (let [store (seed-store store)
+         plan (ticket-plan store party-size source idempotency-key)]
+     (case (:kind plan)
+       :error (:error plan)
+       :duplicate (ok store (assoc (ticket-create-value store (:ticket plan)) :duplicate true))
+       :new (build-new-ticket store n party-size source now token id idempotency-key
+                              (:table-type plan))))))
 
 (defn call-next [store tt now]
   (let [store (seed-store store)]
