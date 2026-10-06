@@ -102,3 +102,20 @@
           (is (= 3 (:counter (:body (queue-status system2 "store-1" :two)))))))
       (finally
         (io/delete-file db-path true)))))
+
+(deftest timestamps-are-epoch-seconds
+  (let [db-path (temp-path "shop-queue-epoch")]
+    (try
+      (let [system (core/start-system! db-path)
+            before (quot (System/currentTimeMillis) 1000)
+            r (post-ticket system "store-1" {:party-size 2 :source "remote"})
+            after (quot (System/currentTimeMillis) 1000)
+            created-at (get-in (storage/load-all (:db system))
+                               ["store-1" :tickets (:id (:body r)) :created-at])]
+        (is (= 201 (:status r)))
+        (is (integer? created-at))
+        (is (<= before created-at after))
+        (testing "created-at 是 epoch 秒（约 10 位），不是毫秒"
+          (is (<= 1000000000 created-at))))
+      (finally
+        (io/delete-file db-path true)))))
