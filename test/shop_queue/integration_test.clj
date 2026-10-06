@@ -39,6 +39,9 @@
   (post* path {:headers {"Content-Type" "application/json"}
                :body (json/generate-string body)}))
 
+(defn- uuid-string? [s]
+  (boolean (try (java.util.UUID/fromString s) (catch Exception _ nil))))
+
 (defn with-test-server [f]
   (let [db-path (str (io/file (System/getProperty "java.io.tmpdir")
                               (str "shop-queue-it-" (java.util.UUID/randomUUID) ".db")))
@@ -60,7 +63,8 @@
 (use-fixtures :each with-test-server)
 
 (deftest full-store-queue-flow
-  (let [token (atom nil)]
+  (let [token (atom nil)
+        ticket-id (atom nil)]
     (testing "商家开张：store-1 启动即就绪，三条桌型队列默认开启"
       (let [b (:body (get*))]
         (is (= #{:two :three :large}
@@ -76,31 +80,32 @@
         (is (= "open" (:status qview)))
         (is (= 0 (:counter qview)))))
 
-    (testing "顾客取号：2 人远程取号 → A001，前方 0 桌"
+    (testing "顾客取号：2 人远程取号 → UUID，前方 0 桌"
       (let [r (post-json (url "stores" "store-1" "tickets") {:party-size 2 :source "remote"})
             b (:body r)]
         (is (= 201 (:status r)))
-        (is (= "A001" (:id b)))
+        (is (uuid-string? (:id b)))
         (is (= "two" (:table-type b)))
         (is (= 0 (:parties-ahead b)))
-        (reset! token (:token b))))
+        (reset! token (:token b))
+        (reset! ticket-id (:id b))))
 
     (testing "顾客凭 token 轮询状态 → waiting"
       (let [b (:body (get* "stores" "store-1" "tickets" @token))]
-        (is (= "A001" (:id b)))
+        (is (= @ticket-id (:id b)))
         (is (= "waiting" (:status b)))))
 
-    (testing "商家叫号 → A001"
+    (testing "商家叫号 → 当前票"
       (let [r (post* (url "stores" "store-1" "queues" "two" "call"))
             b (:body r)]
         (is (= 200 (:status r)))
-        (is (= "A001" (:id b)))))
+        (is (= @ticket-id (:id b)))))
 
     (testing "顾客入座（吃饭）→ seated"
-      (let [r (post* (url "stores" "store-1" "queues" "two" "tickets" "A001" "seat"))
+      (let [r (post* (url "stores" "store-1" "queues" "two" "tickets" @ticket-id "seat"))
             b (:body r)]
         (is (= 200 (:status r)))
-        (is (= "A001" (:id b)))))
+        (is (= @ticket-id (:id b)))))
 
     (testing "入座后再次查询状态 → seated"
       (let [b (:body (get* "stores" "store-1" "tickets" @token))]
@@ -113,7 +118,9 @@
         (is (= 409 (:status r)))
         (is (= "queue-closed" (:error b)))))
 
-    (testing "重启后状态保留：从 SQLite 重载，A001 仍为 seated、计数为 1"
+    (testing "重启后状态保留：从 SQLite 重载，票仍为 seated、计数为 1"
       (let [loaded (storage/load-all *db*)]
-        (is (= :seated (get-in loaded ["store-1" :tickets "A001" :status])))
+        (is (= :seated (get-in loaded ["store-1" :tickets @ticket-id :status])))
         (is (= 1 (get-in loaded ["store-1" :queues :two :counter])))))))
+
+(comment (full-store-queue-flow))

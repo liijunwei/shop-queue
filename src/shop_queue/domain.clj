@@ -4,9 +4,9 @@
   {:ok false :error {:code .. :message ..}}. No IO happens here.")
 
 (def default-table-types
-  {:two   {:label "2人"  :prefix "A" :min 2 :max 2}
-   :three {:label "3人"  :prefix "B" :min 3 :max 3}
-   :large {:label "多人" :prefix "C" :min 4 :max nil}})
+  {:two   {:label "2人"  :min 2 :max 2}
+   :three {:label "3人"  :min 3 :max 3}
+   :large {:label "多人" :min 4 :max nil}})
 
 (def max-party-size 50)
 (def valid-sources #{"remote" "scan"})
@@ -16,9 +16,6 @@
 
 (defn valid-party-size? [n]
   (and (integer? n) (pos? n)))
-
-(defn ticket-id [prefix n]
-  (str prefix (format "%03d" n)))
 
 ;; Ensure a store carries every configured table-type queue plus a :tickets map.
 (defn seed-store
@@ -71,7 +68,7 @@
 
 ;; ---- Commands ----
 
-(defn create-ticket [store party-size source now token]
+(defn create-ticket [store party-size source now token id]
   (let [store (seed-store store)
         tt (match-table-type (:table-types store) party-size)]
     (cond
@@ -92,7 +89,6 @@
 
       :else
       (let [n (inc (long (get-in store [:queues tt :counter] 0)))
-            id (ticket-id (:prefix (get-in store [:table-types tt])) n)
             ticket {:n n :token token :table-type tt :party-size party-size
                     :source source :status :waiting :created-at now :called-at nil}
             new-store (-> store

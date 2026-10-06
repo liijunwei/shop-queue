@@ -100,8 +100,9 @@
     (if (not (domain/valid-party-size? party-size))
       (json-response 400 {:error "invalid-party-size" :message "party-size must be a positive integer"})
       (let [token (str (java.util.UUID/randomUUID))
+            id (str (java.util.UUID/randomUUID))
             result (transact! system store-id
-                     (fn [s] (domain/create-ticket s party-size source (now-ms) token)))]
+                     (fn [s] (domain/create-ticket s party-size source (now-ms) token id)))]
         (if (:ok result) (json-response 201 (:value result)) (domain-error result))))))
 
 (defn- ticket-status! [system store-id token]
