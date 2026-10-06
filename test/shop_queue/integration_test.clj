@@ -8,6 +8,7 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
+            [next.jdbc :as jdbc]
             [org.httpkit.client :as client]
             [org.httpkit.server :as http]
             [shop-queue.api :as api]
@@ -426,5 +427,53 @@
              (:body (get* "stores" "store-9" "tickets" "no-such-token")))))
     (testing "token 在自己所属的 store 里仍能正常查到"
       (is (= 200 (:status (get* "stores" "store-1" "tickets" token)))))))
+
+(deftest healthz-reflects-db-writability
+  (testing "可写数据库返回 200 ok/writable"
+    (let [r (get* "healthz")
+          b (:body r)]
+      (is (= 200 (:status r)))
+      (is (= {:status "ok" :db "writable"} b))))
+  (testing "只读数据库返回 503 unavailable/not-writable"
+    (let [ro-ds (jdbc/get-datasource {:jdbcUrl (str "jdbc:sqlite:" *db-path* "?open_mode=1")})
+          ro-system {:db ro-ds
+                     :state (atom {:stores {"store-1" (domain/seed-store {})}})
+                     :subs (atom {})}
+          resp ((api/handler ro-system) {:request-method :get :uri "/healthz"})]
+      (is (= 503 (:status resp)))
+      (is (= {:status "unavailable" :db "not-writable"}
+             (json/parse-string (:body resp) true))))))
+
+(deftest request-log-fields-derive-store-and-ticket
+  (testing "store-id 与 ticket-id 从 URI 提取"
+    (is (= {:method "post"
+            :uri "/stores/s1/queues/two/tickets/t1/seat"
+            :store-id "s1"
+            :ticket-id "t1"}
+           (api/request-log-fields
+             {:request-method :post :uri "/stores/s1/queues/two/tickets/t1/seat"}))))
+  (testing "只含 store-id 时 ticket-id 为 nil"
+    (is (= {:method "get" :uri "/stores/s1/tickets" :store-id "s1" :ticket-id nil}
+           (api/request-log-fields {:request-method :get :uri "/stores/s1/tickets"}))))
+  (testing "非 stores 路由两者均为 nil"
+    (is (= {:method "get" :uri "/healthz" :store-id nil :ticket-id nil}
+           (api/request-log-fields {:request-method :get :uri "/healthz"})))))
+
+(deftest request-log-line-carries-structured-fields
+  (let [system {:db *db*
+                :state (atom {:stores {"store-1" (domain/seed-store {})}})
+                :subs (atom {})}
+        out (with-out-str
+              ((api/handler system)
+               {:request-method :post
+                :uri "/stores/store-1/queues/two/tickets/some-ticket-id/seat"}))
+        log (json/parse-string (str/trim out) true)]
+    (is (= "request" (:event log)))
+    (is (uuid-string? (:request-id log)))
+    (is (= "post" (:method log)))
+    (is (= "store-1" (:store-id log)))
+    (is (= "some-ticket-id" (:ticket-id log)))
+    (is (= 404 (:status log)))
+    (is (number? (:duration-ms log)))))
 
 (comment (full-store-queue-flow))
