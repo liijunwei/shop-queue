@@ -20,7 +20,7 @@
   (case code
     (:invalid-party-size :party-size-too-large :invalid-source :no-matching-table-type :invalid-threshold) 400
     :not-found 404
-    (:queue-closed :queue-drained :empty-queue :invalid-transition :queue-too-long) 409
+    (:queue-closed :queue-drained :empty-queue :invalid-transition :queue-too-long :token-conflict) 409
     500))
 
 (defn- domain-error [result]
@@ -151,6 +151,37 @@
           (storage/append-operation! (:db system) store-id record)))
       result)))
 
+(defn- transact-create-ticket! [system store-id party-size source idempotency-key token id]
+  (locking write-lock
+    (let [old-store (get-store system store-id)
+          plan (domain/ticket-plan old-store party-size source idempotency-key)]
+      (case (:kind plan)
+        :error
+        (:error plan)
+
+        :duplicate
+        (domain/create-ticket old-store party-size source (now-ms) token id idempotency-key)
+
+        :new
+        (if-not (storage/claim-token! (:db system) store-id token)
+          {:ok false :error {:code :token-conflict :message "token already exists"}}
+          (let [tt (:table-type plan)
+                current (long (get-in old-store [:queues tt :counter] 0))
+                n (storage/next-counter! (:db system) store-id tt current)
+                result (domain/create-ticket old-store party-size source (now-ms) token id idempotency-key n)
+                new-store (:state result)]
+            (storage/save-store! (:db system) store-id new-store)
+            (swap! (:state system) assoc-in [:stores store-id] new-store)
+            (doseq [ev (domain/diff-events old-store new-store)]
+              (publish-event! (:subs system) ev))
+            (let [record ((op :customer token :create-ticket
+                              (fn [r] (when-not (:duplicate (:value r))
+                                        {:kind :ticket :id (:id (:value r))})))
+                          result)]
+              (when record
+                (storage/append-operation! (:db system) store-id record)))
+              result))))))
+
 ;; ---- Handlers ----
 
 (defn- home [system]
@@ -175,11 +206,7 @@
         (json-response 400 {:error "invalid-party-size" :message "party-size must be a positive integer"})
         (let [token (str (java.util.UUID/randomUUID))
               id (str (java.util.UUID/randomUUID))
-              result (transact! system store-id
-                       (fn [s] (domain/create-ticket s party-size source (now-ms) token id idempotency-key))
-                       (op :customer token :create-ticket
-                           (fn [r] (when-not (:duplicate (:value r))
-                                     {:kind :ticket :id (or (:id (:value r)) id)}))))]
+              result (transact-create-ticket! system store-id party-size source idempotency-key token id)]
           (if (:ok result)
             (json-response (if (:duplicate (:value result)) 200 201) (:value result))
             (domain-error result)))))))
