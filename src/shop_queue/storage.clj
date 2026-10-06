@@ -17,7 +17,7 @@
 
 (defn init! [ds]
   (jdbc/execute! ds
-    ["CREATE TABLE IF NOT EXISTS stores (store_id TEXT PRIMARY KEY, data TEXT NOT NULL)"])
+                 ["CREATE TABLE IF NOT EXISTS stores (store_id TEXT PRIMARY KEY, data TEXT NOT NULL)"])
   ds)
 
 (defn load-all [ds]
@@ -29,6 +29,6 @@
 
 (defn save-store! [ds store-id store]
   (jdbc/execute! ds
-    ["INSERT INTO stores (store_id, data) VALUES (?, ?)
+                 ["INSERT INTO stores (store_id, data) VALUES (?, ?)
       ON CONFLICT(store_id) DO UPDATE SET data = excluded.data"
-     store-id (pr-str store)]))
+                  store-id (pr-str store)]))
