@@ -13,7 +13,7 @@
 (def default-config
   {:seed 42
    :parties 60
-   :inter-arrival-mean 8.0
+   :inter-arrival-mean 5.0
    :service-mean {:two 9.0 :three 12.0 :large 16.0}
    :no-show-rate 0.10
    :party-size-weights {:two 0.5 :three 0.25 :large 0.25}
