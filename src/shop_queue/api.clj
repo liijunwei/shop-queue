@@ -18,14 +18,17 @@
 
 (defn- error-status [code]
   (case code
-    (:invalid-party-size :party-size-too-large :invalid-source :no-matching-table-type) 400
+    (:invalid-party-size :party-size-too-large :invalid-source :no-matching-table-type :invalid-threshold) 400
     :not-found 404
-    (:queue-closed :empty-queue :ticket-in-flight :invalid-transition) 409
+    (:queue-closed :queue-drained :empty-queue :invalid-transition :queue-too-long) 409
     500))
 
 (defn- domain-error [result]
   (let [{:keys [code message]} (:error result)]
     (json-response (error-status code) {:error (name code) :message message})))
+
+(defn- not-found [message]
+  (json-response 404 {:error "not-found" :message message}))
 
 (defn- body-string [req]
   (let [b (:body req)]
@@ -43,6 +46,41 @@
   (->> (str/split (or uri "") #"/")
        (remove str/blank?)
        vec))
+
+(defn request-log-fields
+  "Derive the structured fields carried by a request log line: :store-id and
+  :ticket-id when the URI path identifies them, plus :method and :uri."
+  [req]
+  (let [s (segments (:uri req))]
+    {:method (some-> (:request-method req) name)
+     :uri (:uri req)
+     :store-id (when (and (= "stores" (first s)) (nth s 1 nil)) (nth s 1))
+     :ticket-id (when (and (= "stores" (first s))
+                           (= "queues" (nth s 2 nil))
+                           (= "tickets" (nth s 4 nil))
+                           (nth s 5 nil))
+                  (nth s 5))}))
+
+(defn- query-params [req]
+  (let [s (:query-string req)]
+    (if (str/blank? s)
+      {}
+      (into {}
+            (for [pair (str/split s #"&")
+                  :let [[k v] (str/split pair #"=" 2)]
+                  :when (not (str/blank? k))]
+              [(java.net.URLDecoder/decode k "UTF-8")
+               (java.net.URLDecoder/decode (or v "") "UTF-8")])))))
+
+(defn- query-param [req k]
+  (get (query-params req) k))
+
+(defn- parse-long-str [s]
+  (when (and s (not (str/blank? s)))
+    (try (Long/parseLong s) (catch NumberFormatException _ nil))))
+
+(defn- parse-int-param [req k default]
+  (or (parse-long-str (query-param req k)) default))
 
 ;; ---- SSE registry (IO state, never inside domain state) ----
 
@@ -72,9 +110,34 @@
 ;; ---- State access + write path ----
 
 (defn- get-store [system store-id]
-  (domain/seed-store (get-in @(:state system) [:stores store-id])))
+  (when-let [store (get-in @(:state system) [:stores store-id])]
+    (domain/seed-store store)))
 
-(defn- transact! [system store-id f]
+(defn- op [actor actor-id action target-fn]
+  (fn [result]
+    (let [target (target-fn result)]
+      (when target
+        {:ts (now-ms)
+         :actor actor
+         :actor-id actor-id
+         :action action
+         :target target
+         :result (if (:ok result) :ok :error)
+         :details (if (:ok result) (:value result) (:error result))}))))
+
+(defn- queue-op [action tt]
+  (let [action' (case action
+                  :open :open-queue
+                  :close :close-queue
+                  :drain :drain-queue
+                  :call :call)]
+    (op :staff "staff" action'
+        (fn [result]
+          (if (and (= :call action') (:ok result))
+            {:kind :ticket :id (:id (:value result))}
+            {:kind :queue :table-type tt})))))
+
+(defn- transact! [system store-id f op]
   (locking write-lock
     (let [old-store (get-store system store-id)
           result (f old-store)]
@@ -83,6 +146,9 @@
         (swap! (:state system) assoc-in [:stores store-id] (:state result))
         (doseq [ev (domain/diff-events old-store (:state result))]
           (publish-event! (:subs system) ev)))
+      (when op
+        (when-let [record (op result)]
+          (storage/append-operation! (:db system) store-id record)))
       result)))
 
 ;; ---- Handlers ----
@@ -93,61 +159,133 @@
                    (map (fn [[id s]] [id (domain/store-view s)]))
                    (:stores @(:state system))) }))
 
+(defn- healthz! [system]
+  (if (storage/writable? (:db system))
+    (json-response 200 {:status "ok" :db "writable"})
+    (json-response 503 {:status "unavailable" :db "not-writable"})))
+
 (defn- create-ticket! [system store-id req]
-  (let [body (parse-json req)
-        party-size (:party-size body)
-        source (or (:source body) "remote")]
-    (if (not (domain/valid-party-size? party-size))
-      (json-response 400 {:error "invalid-party-size" :message "party-size must be a positive integer"})
-      (let [token (str (java.util.UUID/randomUUID))
-            id (str (java.util.UUID/randomUUID))
-            result (transact! system store-id
-                     (fn [s] (domain/create-ticket s party-size source (now-ms) token id)))]
-        (if (:ok result) (json-response 201 (:value result)) (domain-error result))))))
+  (if-not (get-store system store-id)
+    (not-found "store not found")
+    (let [body (parse-json req)
+          party-size (:party-size body)
+          source (or (:source body) "remote")
+          idempotency-key (not-empty (:idempotency-key body))]
+      (if (not (domain/valid-party-size? party-size))
+        (json-response 400 {:error "invalid-party-size" :message "party-size must be a positive integer"})
+        (let [token (str (java.util.UUID/randomUUID))
+              id (str (java.util.UUID/randomUUID))
+              result (transact! system store-id
+                       (fn [s] (domain/create-ticket s party-size source (now-ms) token id idempotency-key))
+                       (op :customer token :create-ticket
+                           (fn [r] (when-not (:duplicate (:value r))
+                                     {:kind :ticket :id (or (:id (:value r)) id)}))))]
+          (if (:ok result)
+            (json-response (if (:duplicate (:value result)) 200 201) (:value result))
+            (domain-error result)))))))
 
 (defn- ticket-status! [system store-id token]
-  (if-let [view (domain/ticket-status-view (get-store system store-id) token)]
+  (if-let [view (some-> (get-store system store-id)
+                        (domain/ticket-status-view token))]
     (json-response 200 view)
-    (json-response 404 {:error "not-found" :message "ticket not found"})))
+    (not-found "ticket not found")))
 
 (defn- cancel-by-token! [system store-id token]
-  (if-let [t (domain/ticket-by-token (get-store system store-id) token)]
-    (let [result (transact! system store-id
-                   (fn [s] (domain/cancel s (:table-type t) (:id t))))]
+  (if-let [t (some-> (get-store system store-id)
+                     (domain/ticket-by-token token))]
+    (let [id (:id t)
+          result (transact! system store-id
+                   (fn [s] (domain/cancel s (:table-type t) id))
+                   (op :customer token :cancel (constantly {:kind :ticket :id id})))]
       (if (:ok result) (json-response 200 (:value result)) (domain-error result)))
-    (json-response 404 {:error "not-found" :message "ticket not found"})))
+    (not-found "ticket not found")))
 
 (defn- queue-status! [system store-id tt]
-  (if-let [view (domain/queue-view (get-store system store-id) tt)]
+  (if-let [view (some-> (get-store system store-id)
+                        (domain/queue-view tt))]
     (json-response 200 view)
-    (json-response 404 {:error "not-found" :message "unknown table type"})))
+    (not-found "unknown table type")))
 
 (defn- queue-action! [system store-id tt action]
   (let [f (case action
             :open (fn [s] (domain/open-queue s tt))
             :close (fn [s] (domain/close-queue s tt))
+            :drain (fn [s] (domain/drain-queue s tt))
             :call (fn [s] (domain/call-next s tt (now-ms)))
             nil)]
-    (if (nil? f)
-      (json-response 404 {:error "not-found" :message "unknown action"})
-      (let [result (transact! system store-id f)]
+    (cond
+      (nil? f)
+      (not-found "unknown action")
+
+      (nil? (get-store system store-id))
+      (not-found "store not found")
+
+      :else
+      (let [result (transact! system store-id f (queue-op action tt))]
         (if (:ok result) (json-response 200 (:value result)) (domain-error result))))))
+
+(defn- set-threshold! [system store-id req]
+  (if-not (get-store system store-id)
+    (not-found "store not found")
+    (let [body (parse-json req)
+          threshold (:threshold body)]
+      (if (not (and (integer? threshold) (not (neg? threshold))))
+        (json-response 400 {:error "invalid-threshold"
+                            :message "requeue-threshold must be a non-negative integer"})
+        (let [result (transact! system store-id
+                       (fn [s] (domain/set-requeue-threshold s threshold))
+                       (op :staff "staff" :set-requeue-threshold
+                           (constantly {:kind :store :requeue-threshold threshold})))]
+          (if (:ok result) (json-response 200 (:value result)) (domain-error result)))))))
 
 (defn- ticket-action! [system store-id tt id action]
   (let [f (case action
             :seat (fn [s] (domain/seat s tt id (now-ms)))
             :no-show (fn [s] (domain/no-show s tt id (now-ms)))
+            :requeue (fn [s] (domain/requeue s tt id (now-ms)))
             :cancel (fn [s] (domain/cancel s tt id))
             nil)]
-    (if (nil? f)
-      (json-response 404 {:error "not-found" :message "unknown action"})
-      (let [result (transact! system store-id f)]
+    (cond
+      (nil? f)
+      (not-found "unknown action")
+
+      (nil? (get-store system store-id))
+      (not-found "store not found")
+
+      :else
+      (let [result (transact! system store-id f
+                      (op :staff "staff" action (constantly {:kind :ticket :id id})))]
         (if (:ok result) (json-response 200 (:value result)) (domain-error result))))))
 
+(defn- operations-list! [system store-id req]
+  (if-not (get-store system store-id)
+    (not-found "store not found")
+    (let [ops (storage/load-operations (:db system) store-id)
+          actor (some-> (query-param req "actor") not-empty keyword)
+          action (some-> (query-param req "action") not-empty keyword)
+          since (parse-long-str (query-param req "since"))
+          limit (max 1 (min 1000 (parse-int-param req "limit" 100)))
+          offset (max 0 (parse-int-param req "offset" 0))
+          filtered (domain/query-operations ops {:actor actor :action action :since since})
+          total (count filtered)
+          page (->> filtered (drop offset) (take limit) vec)]
+      (json-response 200 {:operations page :total total :limit limit :offset offset}))))
+
+(defn- ticket-operations! [system store-id token]
+  (if-let [t (some-> (get-store system store-id)
+                     (domain/ticket-by-token token))]
+    (let [id (:id t)
+          timeline (->> (storage/load-operations (:db system) store-id)
+                        (filter #(and (= :ticket (:kind (:target %)))
+                                      (= id (:id (:target %)))))
+                        vec)]
+      (json-response 200 {:ticket-id id :operations timeline}))
+    (not-found "ticket not found")))
+
 (defn- sse! [system req store-id token]
-  (let [store (get-store system store-id)]
+  (if-let [store (get-store system store-id)]
     (if-not (domain/ticket-by-token store token)
-      (json-response 404 {:error "not-found" :message "ticket not found"})
+      (not-found "ticket not found")
       (http/as-channel req
         {:on-open (fn [ch]
                     (subscribe! (:subs system) :by-token token ch)
@@ -159,17 +297,24 @@
                        :body (sse-frame :snapshot (domain/ticket-status-view store token))}
                       false))
          :on-close (fn [ch _status]
-                     (unsubscribe! (:subs system) :by-token token ch))}))))
+                     (unsubscribe! (:subs system) :by-token token ch))}))
+    (not-found "ticket not found")))
 
 (defn- dispatch [system req]
   (let [m (:request-method req)
         s (segments (:uri req))]
     (cond
+      (and (= :get m) (= 1 (count s)) (= "healthz" (nth s 0)))
+      (healthz! system)
+
       (and (= :get m) (empty? s))
       (home system)
 
       (and (= :post m) (= 3 (count s)) (= "stores" (nth s 0)) (= "tickets" (nth s 2)))
       (create-ticket! system (nth s 1) req)
+
+      (and (= :post m) (= 3 (count s)) (= "stores" (nth s 0)) (= "requeue-threshold" (nth s 2)))
+      (set-threshold! system (nth s 1) req)
 
       (and (= :get m) (= 4 (count s)) (= "stores" (nth s 0)) (= "tickets" (nth s 2)))
       (ticket-status! system (nth s 1) (nth s 3))
@@ -189,12 +334,36 @@
       (and (= :get m) (= 4 (count s)) (= "stores" (nth s 0)) (= "events" (nth s 2)))
       (sse! system req (nth s 1) (nth s 3))
 
+      (and (= :get m) (= 3 (count s)) (= "stores" (nth s 0)) (= "operations" (nth s 2)))
+      (operations-list! system (nth s 1) req)
+
+      (and (= :get m) (= 5 (count s)) (= "stores" (nth s 0)) (= "tickets" (nth s 2)) (= "operations" (nth s 4)))
+      (ticket-operations! system (nth s 1) (nth s 3))
+
       :else
       (json-response 404 {:error "not-found" :message "no such route"}))))
 
+(defn- log-request! [fields]
+  (println (json/generate-string (into {} (remove (comp nil? val)) fields))))
+
 (defn handler [system]
   (fn [req]
-    (try
-      (dispatch system req)
-      (catch Exception e
-        (json-response 500 {:error "internal" :message (str e)})))))
+    (let [request-id (str (java.util.UUID/randomUUID))
+          start (System/nanoTime)
+          base (request-log-fields req)
+          duration-ms (fn [] (long (/ (- (System/nanoTime) start) 1000000)))]
+      (try
+        (let [resp (dispatch system req)]
+          (log-request! (assoc base
+                               :event "request"
+                               :request-id request-id
+                               :status (:status resp)
+                               :duration-ms (duration-ms)))
+          resp)
+        (catch Exception e
+          (log-request! (assoc base
+                               :event "request"
+                               :request-id request-id
+                               :status 500
+                               :duration-ms (duration-ms)))
+          (json-response 500 {:error "internal" :message (str e)}))))))

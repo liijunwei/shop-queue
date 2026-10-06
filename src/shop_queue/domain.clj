@@ -10,6 +10,7 @@
 
 (def max-party-size 50)
 (def valid-sources #{"remote" "scan"})
+(def default-requeue-threshold 10)
 
 (defn- ok [state value] {:ok true :state state :value value})
 (defn- err [code message] {:ok false :error {:code code :message message}})
@@ -30,14 +31,19 @@
      (-> store
          (assoc :table-types table-types)
          (assoc :queues queues)
-         (update :tickets #(or % {}))))))
+         (update :tickets #(or % {}))
+         (update :idempotency #(or % {}))
+         (update :requeue-threshold #(or % default-requeue-threshold))))))
 
-;; Smallest capacity that can seat n; :max nil means no upper bound.
+;; Match a party of n to the smallest table type that can seat it:
+;; - candidate table types must satisfy capacity (:max >= n; :max nil means no
+;;   upper bound);
+;; - among candidates, pick the one with the smallest :min (ascending).
 (defn match-table-type [table-types n]
   (->> table-types
        (filter (fn [[_ {:keys [max]}]]
                  (or (nil? max) (>= max n))))
-       (sort-by (fn [[_ {:keys [max]}]] (if (nil? max) Long/MAX_VALUE max)))
+       (sort-by (fn [[_ {:keys [min]}]] min))
        ffirst))
 
 ;; ---- Derived views (single source of truth is :tickets + :n) ----
@@ -68,34 +74,58 @@
 
 ;; ---- Commands ----
 
-(defn create-ticket [store party-size source now token id]
-  (let [store (seed-store store)
-        tt (match-table-type (:table-types store) party-size)]
-    (cond
-      (not (valid-party-size? party-size))
-      (err :invalid-party-size "party-size must be a positive integer")
+(defn- ticket-create-value [store t]
+  (let [tt (:table-type t)]
+    {:id (:id t)
+     :token (:token t)
+     :table-type tt
+     :party-size (:party-size t)
+     :parties-ahead (parties-ahead store tt (:n t))}))
 
-      (> party-size max-party-size)
-      (err :party-size-too-large (str "party-size exceeds " max-party-size))
+(defn create-ticket
+  "Create a ticket. When a non-nil `idempotency-key` has already been used in
+  this store, return the existing ticket unchanged and flag the replay with
+  :duplicate true; state is left untouched."
+  ([store party-size source now token id]
+   (create-ticket store party-size source now token id nil))
+  ([store party-size source now token id idempotency-key]
+   (let [store (seed-store store)
+         existing (when idempotency-key
+                    (when-let [existing-id (get-in store [:idempotency idempotency-key])]
+                      (when-let [t (get-in store [:tickets existing-id])]
+                        (assoc t :id existing-id))))]
+     (cond
+       (not (valid-party-size? party-size))
+       (err :invalid-party-size "party-size must be a positive integer")
 
-      (not (contains? valid-sources source))
-      (err :invalid-source "source must be remote or scan")
+       (> party-size max-party-size)
+       (err :party-size-too-large (str "party-size exceeds " max-party-size))
 
-      (nil? tt)
-      (err :no-matching-table-type "party-size exceeds every table size")
+       (not (contains? valid-sources source))
+       (err :invalid-source "source must be remote or scan")
 
-      (= :closed (get-in store [:queues tt :status]))
-      (err :queue-closed "queue is closed")
+       existing
+       (ok store (assoc (ticket-create-value store existing) :duplicate true))
 
-      :else
-      (let [n (inc (long (get-in store [:queues tt :counter] 0)))
-            ticket {:n n :token token :table-type tt :party-size party-size
-                    :source source :status :waiting :created-at now :called-at nil}
-            new-store (-> store
-                          (assoc-in [:queues tt :counter] n)
-                          (assoc-in [:tickets id] ticket))]
-        (ok new-store {:id id :token token :table-type tt :party-size party-size
-                       :parties-ahead (parties-ahead new-store tt n)})))))
+       :else
+       (let [tt (match-table-type (:table-types store) party-size)]
+         (cond
+           (nil? tt)
+           (err :no-matching-table-type "party-size exceeds every table size")
+
+           (not= :open (get-in store [:queues tt :status]))
+           (err :queue-closed "queue is closed")
+
+           :else
+           (let [n (inc (long (get-in store [:queues tt :counter] 0)))
+                 ticket {:n n :token token :table-type tt :party-size party-size
+                         :source source :status :waiting :created-at now :called-at nil}
+                 new-store (-> store
+                               (assoc-in [:queues tt :counter] n)
+                               (assoc-in [:tickets id] ticket)
+                               (cond-> idempotency-key
+                                 (assoc-in [:idempotency idempotency-key] id)))]
+             (ok new-store (ticket-create-value new-store (assoc ticket :id id))))))))))
 
 (defn call-next [store tt now]
   (let [store (seed-store store)]
@@ -103,15 +133,21 @@
       (not (contains? (:table-types store) tt))
       (err :not-found "unknown table type")
 
-      (current-called store tt)
-      (err :ticket-in-flight (str "call " (:id (current-called store tt)) " first"))
+      (= :drained (get-in store [:queues tt :status]))
+      (err :queue-drained "queue is drained")
 
       (empty? (waiting-tickets store tt))
       (err :empty-queue "no waiting tickets")
 
       :else
       (let [nxt (first (waiting-tickets store tt))
-            new-store (-> store
+            prev (current-called store tt)
+            ;; At most one :called ticket per queue: if the previous called
+            ;; ticket is still unhandled, auto-mark it :no-show before advancing.
+            no-showed (if prev
+                        (assoc-in store [:tickets (:id prev) :status] :no-show)
+                        store)
+            new-store (-> no-showed
                           (assoc-in [:tickets (:id nxt) :status] :called)
                           (assoc-in [:tickets (:id nxt) :called-at] now))]
         (ok new-store {:id (:id nxt) :token (:token nxt)})))))
@@ -127,6 +163,36 @@
 
 (defn seat [store tt id _now] (finalize store tt id :seated))
 (defn no-show [store tt id _now] (finalize store tt id :no-show))
+
+(defn requeue
+  "过号回来重排：把一张 :no-show 票重新放回该桌型等待队列。
+  - 若当前等待队列长度超过 :requeue-threshold（可配置），返回 :queue-too-long，
+    提示顾客重新取号（调用 create-ticket）；
+  - 否则把票插到队首后两桌的位置（队列不足两桌时排到队尾），实现“向后延两桌”。
+  等待队列只按 :n 的相对顺序取号，因此这里对涉及的等待票整体重编号。"
+  [store tt id _now]
+  (let [store (seed-store store)
+        t (some-> (get-in store [:tickets id]) (assoc :id id))]
+    (cond
+      (nil? t) (err :not-found "ticket not found")
+      (not= tt (:table-type t)) (err :not-found "ticket not found")
+      (not= :no-show (:status t)) (err :invalid-transition "ticket is not no-show")
+      (= :drained (get-in store [:queues tt :status])) (err :queue-drained "queue is drained")
+
+      :else
+      (let [waiting (waiting-tickets store tt)
+            threshold (get store :requeue-threshold default-requeue-threshold)]
+        (if (> (count waiting) threshold)
+          (err :queue-too-long "queue is too long, please take a new number")
+          (let [ahead (take 2 waiting)
+                ordered (concat ahead [t] (drop 2 waiting))
+                renumbered (map-indexed (fn [i x] (assoc x :n (inc i))) ordered)
+                by-id (into {} (map (juxt :id identity)) renumbered)
+                new-store (-> store
+                              (assoc :tickets (merge (:tickets store) by-id))
+                              (assoc-in [:tickets id :status] :waiting)
+                              (assoc-in [:tickets id :called-at] nil))]
+            (ok new-store {:id id :parties-ahead (count ahead)})))))))
 
 (defn cancel [store tt id]
   (let [store (seed-store store)
@@ -147,6 +213,31 @@
 (defn open-queue [store tt] (set-queue-status store tt :open))
 (defn close-queue [store tt] (set-queue-status store tt :closed))
 
+(defn drain-queue
+  "打烊清场：停止叫号（状态置 :drained），并把剩余 :waiting 票逐个标 :cancelled。
+  :value 返回被取消的票 id 列表。"
+  [store tt]
+  (let [store (seed-store store)]
+    (cond
+      (not (contains? (:table-types store) tt))
+      (err :not-found "unknown table type")
+
+      :else
+      (let [cancelled (mapv :id (waiting-tickets store tt))
+            cleared (reduce (fn [s id] (assoc-in s [:tickets id :status] :cancelled))
+                            store cancelled)
+            new-store (assoc-in cleared [:queues tt :status] :drained)]
+        (ok new-store {:table-type tt :status :drained :cancelled cancelled})))))
+
+(defn set-requeue-threshold
+  "设置过号重排的队列长度阈值（可配置）。阈值只影响 requeue，不影响取号本身。"
+  [store threshold]
+  (let [store (seed-store store)]
+    (if (and (integer? threshold) (not (neg? threshold)))
+      (ok (assoc store :requeue-threshold threshold)
+          {:requeue-threshold threshold})
+      (err :invalid-threshold "requeue-threshold must be a non-negative integer"))))
+
 ;; ---- Events as a pure projection of the value change ----
 
 (defn diff-events [old-store new-store]
@@ -166,7 +257,10 @@
               :let [old-q (get-in old-store [:queues tt])]
               :when (and old-q (not= (:status old-q) (:status new-q)))]
           {:kind :queue
-           :type (if (= :open (:status new-q)) :queue-open :queue-closed)
+           :type (cond
+                   (= :open (:status new-q)) :queue-open
+                   (= :drained (:status new-q)) :queue-drained
+                   :else :queue-closed)
            :table-type tt})]
     (concat ticket-events queue-events)))
 
@@ -203,3 +297,14 @@
                                :waiting-count (count (waiting-tickets store tt))
                                :current-called (some-> (current-called store tt) :id)}])
                         (:queues store)))}))
+
+;; ---- Operation (audit) records ----
+
+(defn query-operations
+  "Filter already-sorted operation records. `actor` and `action` are keywords,
+  `since` is a millisecond timestamp; a nil filter matches everything."
+  [operations {:keys [actor action since]}]
+  (cond->> operations
+    actor (filter #(= actor (:actor %)))
+    action (filter #(= action (:action %)))
+    since (filter #(>= (long (:ts %)) since))))
