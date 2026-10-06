@@ -240,6 +240,17 @@
       (is (not= (:token t) (:n t)))
       (is (not= (:token t) (:id t))))))
 
+(deftest waiting-order-uses-sequence-not-time
+  (testing "排序只靠顺序号 :n，与时间无关"
+    (let [s1 (:state (d/create-ticket {} 2 "remote" 200 "tok1" "id-1"))
+          s2 (:state (d/create-ticket s1 2 "remote" 100 "tok2" "id-2"))
+          s3 (:state (d/create-ticket s2 2 "remote" 300 "tok3" "id-3"))]
+      (is (= ["id-1" "id-2" "id-3"] (mapv :id (d/waiting-tickets s3 :two))))
+      (testing "created-at 非单调也不影响顺序"
+        (is (= [200 100 300]
+               (mapv #(get-in s3 [:tickets % :created-at])
+                     ["id-1" "id-2" "id-3"])))))))
+
 (deftest requeue-threshold-config
   (testing "seeded store gets the default threshold"
     (is (= d/default-requeue-threshold (get (d/seed-store {}) :requeue-threshold))))
