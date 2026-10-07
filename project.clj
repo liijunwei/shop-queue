@@ -10,5 +10,6 @@
                  [org.xerial/sqlite-jdbc "3.43.0.0"]]
   :main ^:skip-aot shop-queue.core
   :target-path "target/%s"
+  :aliases {"deploy" ["do" "test," "uberjar," "run" "-m" "shop-queue.deploy"]}
   :profiles {:uberjar {:aot :all
                        :jvm-opts ["-Dclojure.compiler.direct-linking=true"]}})

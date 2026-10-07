@@ -17,6 +17,11 @@
   ;; makes a locked database wait briefly instead of failing immediately. The
   ;; driver applies these on every connection it opens (journal_mode persists
   ;; in the database file, busy_timeout is per connection).
+  ;;
+  ;; Concurrency model: one writer process per database file. WAL + busy_timeout
+  ;; smooth reader/writer contention inside that process, but do not make the
+  ;; whole-document store updates safe across multiple processes (see
+  ;; save-store!).
   (jdbc/get-datasource
    {:jdbcUrl (str "jdbc:sqlite:" path "?journal_mode=WAL&busy_timeout=5000")}))
 
@@ -61,7 +66,14 @@
         (jdbc/execute! ds ["SELECT store_id, data FROM stores"]
                        {:builder-fn rs/as-unqualified-kebab-maps})))
 
-(defn save-store! [ds store-id store]
+(defn save-store!
+  "Persist one store's whole document. This is a last-writer-wins upsert of the
+  entire store map, so it is correct only under the declared single-process,
+  single-writer deployment (the API write-lock serializes writers in-process).
+  Two OS processes sharing one database file can silently overwrite each other's
+  store documents even though the counter/token tables are allocated atomically.
+  Keep exactly one writer process per database file."
+  [ds store-id store]
   (jdbc/execute! ds
                  ["INSERT INTO stores (store_id, data) VALUES (?, ?)
       ON CONFLICT(store_id) DO UPDATE SET data = excluded.data"
@@ -101,17 +113,18 @@
 (defn append-operation!
   "Append one operation record to the append-only operations table and return
   the record with its :store-id and monotonically increasing :seq attached.
-  Callers must serialize writes for the same store (the API write-lock does)."
+  The seq is allocated by a single INSERT ... RETURNING statement, so concurrent
+  callers for the same store get distinct, gap-free seqs without a separate
+  read-then-insert race (SQLite serializes writers at the database level)."
   [ds store-id record]
   (let [seq (-> (jdbc/execute! ds
-                 ["SELECT COALESCE(MAX(seq), -1) + 1 AS n
-                  FROM operations WHERE store_id = ?" store-id]
+                 ["INSERT INTO operations (store_id, seq, data)
+                   VALUES (?, COALESCE((SELECT MAX(seq) FROM operations WHERE store_id = ?), -1) + 1, ?)
+                   RETURNING seq"
+                  store-id store-id (pr-str record)]
                  {:builder-fn rs/as-unqualified-kebab-maps})
                 first
-                :n)]
-    (jdbc/execute! ds
-                   ["INSERT INTO operations (store_id, seq, data) VALUES (?, ?, ?)"
-                    store-id seq (pr-str record)])
+                :seq)]
     (assoc record :store-id store-id :seq seq)))
 
 (defn load-operations [ds store-id]

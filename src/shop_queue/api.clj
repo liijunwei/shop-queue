@@ -3,6 +3,7 @@
   registry. The domain stays pure; IO (JSON, SQLite, channels) lives here."
   (:require [cheshire.core :as json]
             [clojure.string :as str]
+            [next.jdbc :as jdbc]
             [org.httpkit.server :as http]
             [shop-queue.domain :as domain]
             [shop-queue.storage :as storage]))
@@ -15,6 +16,12 @@
   100)
 
 (defn- now-epoch-ms [] (System/currentTimeMillis))
+
+(def ^:private rfc3339-formatter
+  (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd'T'HH:mm:ssXXX"))
+
+(defn- rfc3339-now []
+  (.format (java.time.OffsetDateTime/now) rfc3339-formatter))
 
 (defn- json-response [status body]
   {:status status
@@ -114,11 +121,9 @@
   (swap! events update-in [:by-token token]
          (fn [log] (vec (take-last max-event-log (conj (or log []) ev))))))
 
-(defn- current-seq [events] (:seq @events))
-
-(defn- replay-frames [events token last-id]
+(defn- replay-frames [events-snapshot token last-id]
   (when last-id
-    (->> (get-in @events [:by-token token])
+    (->> (get-in events-snapshot [:by-token token])
          (filter #(> (:seq %) last-id))
          (mapv (fn [ev] (sse-frame (:type ev) (:seq ev) ev))))))
 
@@ -171,15 +176,18 @@
 (defn- transact! [system store-id f op]
   (locking write-lock
     (let [old-store (get-store system store-id)
-          result (f old-store)]
+          result (f old-store)
+          record (when op (op result))]
       (when (:ok result)
-        (storage/save-store! (:db system) store-id (:state result))
+        (jdbc/with-transaction [tx (:db system)]
+          (storage/save-store! tx store-id (:state result))
+          (when record
+            (storage/append-operation! tx store-id record)))
         (swap! (:state system) assoc-in [:stores store-id] (:state result))
         (doseq [ev (domain/diff-events old-store (:state result))]
           (publish-event! system ev)))
-      (when op
-        (when-let [record (op result)]
-          (storage/append-operation! (:db system) store-id record)))
+      (when (and record (not (:ok result)))
+        (storage/append-operation! (:db system) store-id record))
       result)))
 
 (defn- transact-create-ticket! [system store-id party-size source idempotency-key token id]
@@ -194,24 +202,27 @@
         (domain/create-ticket old-store party-size source (now-epoch-ms) token id idempotency-key)
 
         :new
-        (if-not (storage/claim-token! (:db system) store-id token)
-          {:ok false :error {:code :token-conflict :message "token already exists"}}
-          (let [tt (:table-type plan)
-                current (long (get-in old-store [:queues tt :counter] 0))
-                n (storage/next-counter! (:db system) store-id tt current)
-                result (domain/create-ticket old-store party-size source (now-epoch-ms) token id idempotency-key n)
-                new-store (:state result)]
-            (storage/save-store! (:db system) store-id new-store)
-            (swap! (:state system) assoc-in [:stores store-id] new-store)
-            (doseq [ev (domain/diff-events old-store new-store)]
-              (publish-event! system ev))
-            (let [record ((op :customer token :create-ticket
-                              (fn [r] (when-not (:duplicate (:value r))
-                                        {:kind :ticket :id (:id (:value r))})))
-                          result)]
-              (when record
-                (storage/append-operation! (:db system) store-id record)))
-              result))))))
+        (let [result (jdbc/with-transaction [tx (:db system)]
+                       (if-not (storage/claim-token! tx store-id token)
+                         {:ok false :error {:code :token-conflict :message "token already exists"}}
+                         (let [tt (:table-type plan)
+                               current (long (get-in old-store [:queues tt :counter] 0))
+                               n (storage/next-counter! tx store-id tt current)
+                               result (domain/create-ticket old-store party-size source (now-epoch-ms) token id idempotency-key n)
+                               new-store (:state result)
+                               record ((op :customer token :create-ticket
+                                         (fn [r] (when-not (:duplicate (:value r))
+                                                   {:kind :ticket :id (:id (:value r))})))
+                                       result)]
+                           (storage/save-store! tx store-id new-store)
+                           (when record
+                             (storage/append-operation! tx store-id record))
+                           result)))]
+          (when (:ok result)
+            (swap! (:state system) assoc-in [:stores store-id] (:state result))
+            (doseq [ev (domain/diff-events old-store (:state result))]
+              (publish-event! system ev)))
+          result)))))
 
 ;; ---- Handlers ----
 
@@ -348,10 +359,10 @@
         {:on-open (fn [ch]
                     (subscribe! (:subs system) :by-token token ch)
                     (let [store (get-store system store-id)
-                          events (:events system)
+                          events-snapshot @(:events system)
                           last-id (parse-long-str (get-in req [:headers "last-event-id"]))
-                          seq (current-seq events)
-                          replay (replay-frames events token last-id)
+                          seq (:seq events-snapshot)
+                          replay (replay-frames events-snapshot token last-id)
                           snapshot-data (assoc (domain/ticket-status-view store token)
                                                :seq seq
                                                :last-event-id last-id)
@@ -412,7 +423,8 @@
       (json-response 404 {:error "not-found" :message "no such route"}))))
 
 (defn- log-request! [fields]
-  (println (json/generate-string (into {} (remove (comp nil? val)) fields))))
+  (println (json/generate-string
+            (into {} (remove (comp nil? val)) (assoc fields :time (rfc3339-now))))))
 
 (defn handler [system]
   (fn [req]

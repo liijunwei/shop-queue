@@ -49,11 +49,18 @@
 `:called-at`，以及操作记录的 `:ts`——都是 epoch 毫秒（整数）。时间只用于展示与
 追溯，不参与任何排序、计数或状态判断。
 
-**排序一律靠顺序号，不靠时间。** 号码的先后只由顺序号 `:n`（评审方案中的
-`:order`，即每桌型队列独立计数的取号顺序）决定，重排时对等待票整体重编号。
-等待队列、`parties-ahead`、`current-called` 一律按 `:n` 排序 / 计数，绝不使用
-`:created-at` / `:called-at` / `:ts` 等时间字段排序。操作记录按其 append-only
-的 `:seq` 排序，查询参数 `since` 也是 epoch 毫秒。
+**并发模型：单进程、单写者。** 写路径由进程内一把锁串行化（`api.clj` 的
+`write-lock`），一个 SQLite 文件同一时刻只允许一个写进程。`counters` 的原子自增与
+`tokens` 的唯一约束只保证「计数 / token 不撞号」，**不**让整店文档的多进程并发写
+安全：两个进程同时改同一家店会互相覆盖（last-writer-wins）。当前不要多进程写同一个
+DB；将来要多实例，需改成单写服务，或给 store 文档加版本号做乐观并发控制。
+
+**排序一律靠顺序号，不靠时间。** 号码先后只由 `:n` 决定。`:n` 是可变队列位次：
+新票由该桌型的 `:counter` 单调分配，`requeue` 重排时对等待票整体重编号；
+`:counter` 只负责给新票发号、不随重排回退。已终态（called / seated / cancelled /
+no-show）票保留历史 `:n`，不参与排序。等待队列、`parties-ahead`、`current-called`
+一律按 `:n` 排序 / 计数，绝不使用 `:created-at` / `:called-at` / `:ts` 等时间字段。
+操作记录按其 append-only 的 `:seq` 排序，查询参数 `since` 也是 epoch 毫秒。
 
 ## 运行
 
@@ -66,6 +73,10 @@ QUEUE_DB=queue.db PORT=8080 lein run
 ```bash
 lein test
 ```
+
+## 部署 / 运维
+
+打包、部署、重启、systemd 配置、备份与安全组等运维信息见 [DEPLOY.md](DEPLOY.md)。
 
 ## 实时推送与断线重连
 
@@ -125,7 +136,8 @@ QUEUE_DB=queue.db BACKUP_DIR=backups lein run -m shop-queue.backup
 计数与落盘前完全一致。手工演练等价步骤为：
 
 1. 造数：取号、叫号、入座。
-2. `kill -9` 模拟断电（SQLite WAL + 单条 `save-store!` 事务保证要么旧状态、要么新状态）。
+2. `kill -9` 模拟断电（每次写命令在同一个 SQLite 事务里完成 counter / token 分配、
+   store 文档落盘与 operation 追加，要么整体成功、要么整体回滚）。
 3. 重启 `lein run`，查询各 token 状态与队列视图，核对与断电前一致。
 
 ## 模块

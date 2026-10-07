@@ -550,7 +550,8 @@
     (is (= "store-1" (:store-id log)))
     (is (= "some-ticket-id" (:ticket-id log)))
     (is (= 404 (:status log)))
-    (is (number? (:duration-ms log)))))
+    (is (number? (:duration-ms log)))
+    (is (re-matches #"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}" (:time log)))))
 
 (deftest sse-events-carry-seq-and-reconnect-recovers-state
   (let [created (post-json (url "stores" "store-1" "tickets") {:party-size 2 :source "remote"})

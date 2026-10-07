@@ -222,7 +222,10 @@
   - 若当前等待队列长度超过 :requeue-threshold（可配置），返回 :queue-too-long，
     提示顾客重新取号（调用 create-ticket）；
   - 否则把票插到队首后两桌的位置（队列不足两桌时排到队尾），实现“向后延两桌”。
-  等待队列只按 :n 的相对顺序取号，因此这里对涉及的等待票整体重编号。"
+  等待队列只按 :n 的相对顺序取号，因此这里对涉及的等待票整体重编号。
+
+  语义约定：:n 是可变队列位次，只对 waiting 票有意义；:counter 是每桌型单调递增的
+  发号器，重排不回退它。已终态票保留历史 :n，不参与任何排序/计数。"
   [store tt id _now]
   (let [store (seed-store store)
         t (some-> (get-in store [:tickets id]) (assoc :id id))]

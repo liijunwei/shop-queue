@@ -6,6 +6,8 @@
   (:require [cheshire.core :as json]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
+            [next.jdbc :as jdbc]
+            [next.jdbc.result-set :as rs]
             [shop-queue.api :as api]
             [shop-queue.core :as core]
             [shop-queue.domain :as domain]
@@ -68,6 +70,46 @@
       (is (false? (storage/claim-token! ds "store-1" "tok-dup")))
       (is (false? (storage/claim-token! ds "store-2" "tok-dup"))
           "token uniqueness is global, not just per store")
+      (finally
+        (io/delete-file db-path true)))))
+
+(deftest append-operation-is-atomic-under-concurrency
+  (let [db-path (temp-path "shop-queue-ops")
+        ds (storage/init! (storage/connect db-path))
+        n 20]
+    (try
+      (let [results (->> (range n)
+                         (mapv (fn [i]
+                                 (future (storage/append-operation! ds "store-1"
+                                                                    {:action :test :i i}))))
+                         (mapv #(:seq (deref %))))]
+        (is (= n (count results)))
+        (is (= n (count (set results))) "concurrent appends are distinct")
+        (is (= (set (range n)) (set results)) "no gap in the sequence"))
+      (finally
+        (io/delete-file db-path true)))))
+
+(deftest create-ticket-rolls-back-counter-and-token-on-failure
+  (let [db-path (temp-path "shop-queue-create-tx")
+        system (core/start-system! db-path)]
+    (try
+      (let [db (:db system)
+            before (get-in @(:state system) [:stores "store-1"])]
+        (with-redefs [storage/append-operation! (fn [& _] (throw (ex-info "boom" {})))]
+          (let [resp ((api/handler system)
+                      {:request-method :post
+                       :uri "/stores/store-1/tickets"
+                       :body (json/generate-string {:party-size 2 :source "remote"})})]
+            (is (= 500 (:status resp)))))
+        (testing "counter, token and store document are all rolled back together"
+          (is (empty? (jdbc/execute! db ["SELECT * FROM counters"]
+                                     {:builder-fn rs/as-unqualified-kebab-maps})))
+          (is (empty? (jdbc/execute! db ["SELECT * FROM tokens"]
+                                     {:builder-fn rs/as-unqualified-kebab-maps})))
+          (is (empty? (get-in (storage/load-all db) ["store-1" :tickets])))
+          (is (= 0 (get-in (storage/load-all db) ["store-1" :queues :two :counter]))))
+        (testing "in-memory state is unchanged"
+          (is (= before (get-in @(:state system) [:stores "store-1"])))))
       (finally
         (io/delete-file db-path true)))))
 
