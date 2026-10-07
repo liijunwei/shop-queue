@@ -15,19 +15,15 @@
 | 数据 | `/opt/shop-queue/queue.db`（SQLite，WAL） |
 | 备份目录 | `/opt/shop-queue/backups/`（每日 02:00 自动备份） |
 
-## 一键命令（Makefile）
+## 一键命令（lein，不依赖 makefile）
 
 ```bash
-make deploy         # 远程部署：打包 → 上传 → 替换 → 重启 → 验证（默认目标）
-make deploy-remote  # 同 make deploy
-make deploy-local   # 本地部署：打包后用 uberjar 在本机前台运行（:8080）
-make restart        # 仅远程重启（不重新打包 / 上传）
-make run            # 本地开发运行（lein run，不重新打包）
-make test           # lein test
-make build          # lein uberjar
+lein deploy        # 远程部署：lein test → uberjar → 上传 → 替换 → 重启 → 验证 /healthz
+lein deploy --dry  # 只打印要执行的命令、不真正部署（预览）
+lein run           # 本地开发运行（不重新打包）
+lein test          # 跑测试
+lein uberjar       # 只打包
 ```
-
-可用环境变量覆盖默认值，例如 `make deploy-local QUEUE_DB=/tmp/q.db PORT=9000`。
 
 ## 打包（本地）
 
