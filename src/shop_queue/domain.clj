@@ -355,7 +355,7 @@
 
 (defn query-operations
   "Filter already-sorted operation records. `actor` and `action` are keywords,
-  `since` is an epoch-seconds timestamp; a nil filter matches everything."
+  `since` is an epoch-milliseconds timestamp; a nil filter matches everything."
   [operations {:keys [actor action since]}]
   (cond->> operations
     actor (filter #(= actor (:actor %)))
