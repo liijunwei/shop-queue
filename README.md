@@ -5,7 +5,18 @@
 ## 排队数据的价值（后续数据分析的入口）
 
 排队数据把「排队」这个原本转瞬即逝、不可见的过程，变成可度量的资产。`storage` 里
-按事件留存的完整历史，加上 append-only 的 `operations` 事件流，是三类决策的原料：
+按事件留存的完整历史，加上 append-only 的 `operations` 事件流，是三类决策的原料。
+
+数据落两类、查两处：
+
+- **店铺状态（`stores`，每店一条 EDN）**：每张票的 `party-size`、`table-type`、
+  `source`（remote/scan）、`token`、`status`、`created-at`、`called-at`、`:n`
+  （顺序号），以及各桌型队列的 `counter` / `status`。
+- **操作日志（`operations`，append-only）**：每条命令一条
+  `{:ts :actor :actor-id :action :target :result :details :seq}`，`:seq` 全局单调
+  递增、可回放。查询：`GET /stores/{store}/operations`（`actor` / `action` /
+  `since` / `limit` / `offset`）、`GET /stores/{store}/tickets/{token}/operations`
+  （单号时间线）。
 
 **看现在（实时运营）**：各桌型当前排多长、下一个叫谁、预计等多久。顾客和店员看到
 同一份状态，减少现场焦虑和扯皮。
@@ -116,31 +127,6 @@ QUEUE_DB=queue.db BACKUP_DIR=backups lein run -m shop-queue.backup
 1. 造数：取号、叫号、入座。
 2. `kill -9` 模拟断电（SQLite WAL + 单条 `save-store!` 事务保证要么旧状态、要么新状态）。
 3. 重启 `lein run`，查询各 token 状态与队列视图，核对与断电前一致。
-
-## 排队数据的价值（后续分析用）
-
-系统落两类数据，是同一份「排队过程」的两个视图：
-
-- **店铺状态（`stores`，每店一条 EDN）**：每张票的 `party-size`、`table-type`、
-  `source`（remote/scan）、`token`、`status`、`created-at`、`called-at`、`:n`
-  （顺序号），以及各桌型队列的 `counter` / `status`。
-- **操作日志（`operations`，append-only）**：每条命令一条
-  `{:ts :actor :actor-id :action :target :result :details :seq}`，`:seq` 全局单调
-  递增、可回放。查询入口：`GET /stores/{store}/operations`（支持
-  `actor` / `action` / `since` / `limit` / `offset` 过滤分页）、
-  `GET /stores/{store}/tickets/{token}/operations`（单号时间线）。
-
-这份数据把「排队」这个转瞬即逝、不可见的过程变成可度量的资产，支撑三类决策：
-
-- **实时运营（看现在）**：各桌型当前排多长、下一个叫谁、预计等多久。
-- **容量与规划（看过去）**：由操作日志可算——到达率按时段分布（排班/营业时段）、
-  各桌型服务时长（桌数）、等待时间分布（SLA/承诺等待）、过号率（提醒/重叫策略）、
-  人数分布（桌型配比）、翻台率（单桌营收）。
-- **改进与仿真（看未来）**：`sim.clj` / `viz.clj` 直接重放同一套 domain，把真实
-  到达/服务/过号分布喂进去，就能在不动现场的情况下回答「加几张多人桌会怎样」
-  「叫号策略换成 X 会怎样」。
-
-注意：当前 `sim` 用的是占位参数，仅演示价值；真正的分析价值要等接入真实流量后兑现。
 
 ## 模块
 
