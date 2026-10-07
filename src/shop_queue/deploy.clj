@@ -13,8 +13,12 @@
   [cmd]
   (println "==>" (str/join " " cmd))
   (let [{:keys [exit out err]} (apply sh cmd)]
-    (when (seq out) (print out))
-    (when (seq err) (print err))
+    (when (seq out)
+      (print out)
+      (when-not (str/ends-with? out "\n") (println)))
+    (when (seq err)
+      (print err)
+      (when-not (str/ends-with? err "\n") (println)))
     {:exit (or exit 0) :out out}))
 
 (defn- required!
