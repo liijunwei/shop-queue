@@ -14,7 +14,7 @@
   are covered by the authoritative snapshot, not by replay."
   100)
 
-(defn- now-epoch-seconds [] (quot (System/currentTimeMillis) 1000))
+(defn- now-epoch-ms [] (System/currentTimeMillis))
 
 (defn- json-response [status body]
   {:status status
@@ -148,7 +148,7 @@
   (fn [result]
     (let [target (target-fn result)]
       (when target
-        {:ts (now-epoch-seconds)
+        {:ts (now-epoch-ms)
          :actor actor
          :actor-id actor-id
          :action action
@@ -191,7 +191,7 @@
         (:error plan)
 
         :duplicate
-        (domain/create-ticket old-store party-size source (now-epoch-seconds) token id idempotency-key)
+        (domain/create-ticket old-store party-size source (now-epoch-ms) token id idempotency-key)
 
         :new
         (if-not (storage/claim-token! (:db system) store-id token)
@@ -199,7 +199,7 @@
           (let [tt (:table-type plan)
                 current (long (get-in old-store [:queues tt :counter] 0))
                 n (storage/next-counter! (:db system) store-id tt current)
-                result (domain/create-ticket old-store party-size source (now-epoch-seconds) token id idempotency-key n)
+                result (domain/create-ticket old-store party-size source (now-epoch-ms) token id idempotency-key n)
                 new-store (:state result)]
             (storage/save-store! (:db system) store-id new-store)
             (swap! (:state system) assoc-in [:stores store-id] new-store)
@@ -269,7 +269,7 @@
             :open (fn [s] (domain/open-queue s tt))
             :close (fn [s] (domain/close-queue s tt))
             :drain (fn [s] (domain/drain-queue s tt))
-            :call (fn [s] (domain/call-next s tt (now-epoch-seconds)))
+            :call (fn [s] (domain/call-next s tt (now-epoch-ms)))
             nil)]
     (cond
       (nil? f)
@@ -298,9 +298,9 @@
 
 (defn- ticket-action! [system store-id tt id action]
   (let [f (case action
-            :seat (fn [s] (domain/seat s tt id (now-epoch-seconds)))
-            :no-show (fn [s] (domain/no-show s tt id (now-epoch-seconds)))
-            :requeue (fn [s] (domain/requeue s tt id (now-epoch-seconds)))
+            :seat (fn [s] (domain/seat s tt id (now-epoch-ms)))
+            :no-show (fn [s] (domain/no-show s tt id (now-epoch-ms)))
+            :requeue (fn [s] (domain/requeue s tt id (now-epoch-ms)))
             :cancel (fn [s] (domain/cancel s tt id))
             nil)]
     (cond
