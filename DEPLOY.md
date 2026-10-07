@@ -15,6 +15,20 @@
 | 数据 | `/opt/shop-queue/queue.db`（SQLite，WAL） |
 | 备份目录 | `/opt/shop-queue/backups/`（每日 02:00 自动备份） |
 
+## 一键命令（Makefile）
+
+```bash
+make deploy         # 远程部署：打包 → 上传 → 替换 → 重启 → 验证（默认目标）
+make deploy-remote  # 同 make deploy
+make deploy-local   # 本地部署：打包后用 uberjar 在本机前台运行（:8080）
+make restart        # 仅远程重启（不重新打包 / 上传）
+make run            # 本地开发运行（lein run，不重新打包）
+make test           # lein test
+make build          # lein uberjar
+```
+
+可用环境变量覆盖默认值，例如 `make deploy-local QUEUE_DB=/tmp/q.db PORT=9000`。
+
 ## 打包（本地）
 
 仓库是 Leiningen 工程，在本机 `/Users/me/codeout/shop-queue` 执行：
