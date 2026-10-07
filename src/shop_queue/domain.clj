@@ -45,7 +45,8 @@
          (assoc :queues queues)
          (update :tickets #(or % {}))
          (update :idempotency #(or % {}))
-         (update :requeue-threshold #(or % default-requeue-threshold))))))
+         (update :requeue-threshold #(or % default-requeue-threshold))
+         (update :version #(or % 0))))))
 
 ;; Match a party of n to the smallest table type that can seat it:
 ;; - candidate table types must satisfy capacity (:max >= n; :max nil means no

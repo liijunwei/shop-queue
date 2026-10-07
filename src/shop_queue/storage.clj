@@ -18,16 +18,25 @@
   ;; driver applies these on every connection it opens (journal_mode persists
   ;; in the database file, busy_timeout is per connection).
   ;;
-  ;; Concurrency model: one writer process per database file. WAL + busy_timeout
-  ;; smooth reader/writer contention inside that process, but do not make the
-  ;; whole-document store updates safe across multiple processes (see
-  ;; save-store!).
+  ;; Concurrency model: in-process writes are serialized by the API write-lock;
+  ;; cross-process writes are protected by the version CAS in `save-store!`,
+  ;; which detects a concurrent modification instead of silently overwriting.
   (jdbc/get-datasource
    {:jdbcUrl (str "jdbc:sqlite:" path "?journal_mode=WAL&busy_timeout=5000")}))
 
+(defn- ensure-version-column [ds]
+  (let [cols (set (map :name (jdbc/execute! ds ["PRAGMA table_info(stores)"]
+                                            {:builder-fn rs/as-unqualified-kebab-maps})))]
+    (when-not (contains? cols "version")
+      (jdbc/execute! ds ["ALTER TABLE stores ADD COLUMN version INTEGER NOT NULL DEFAULT 0"]))))
+
 (defn init! [ds]
   (jdbc/execute! ds
-                 ["CREATE TABLE IF NOT EXISTS stores (store_id TEXT PRIMARY KEY, data TEXT NOT NULL)"])
+                 ["CREATE TABLE IF NOT EXISTS stores (
+                     store_id TEXT PRIMARY KEY,
+                     data TEXT NOT NULL,
+                     version INTEGER NOT NULL DEFAULT 0)"])
+  (ensure-version-column ds)
   (jdbc/execute! ds
                  ["CREATE TABLE IF NOT EXISTS operations (
                      store_id TEXT NOT NULL,
@@ -67,17 +76,28 @@
                        {:builder-fn rs/as-unqualified-kebab-maps})))
 
 (defn save-store!
-  "Persist one store's whole document. This is a last-writer-wins upsert of the
-  entire store map, so it is correct only under the declared single-process,
-  single-writer deployment (the API write-lock serializes writers in-process).
-  Two OS processes sharing one database file can silently overwrite each other's
-  store documents even though the counter/token tables are allocated atomically.
-  Keep exactly one writer process per database file."
+  "Optimistically persist one store's whole document. `store`'s :version is the
+  expected version; on success the document advances by one and the new store
+  (with bumped :version) is returned. When another writer already advanced the
+  version, throws an ExceptionInfo with {:code :store-conflict} so the caller can
+  surface a 409 instead of silently overwriting."
   [ds store-id store]
-  (jdbc/execute! ds
-                 ["INSERT INTO stores (store_id, data) VALUES (?, ?)
-      ON CONFLICT(store_id) DO UPDATE SET data = excluded.data"
-                  store-id (pr-str store)]))
+  (let [expected (long (or (:version store) 0))
+        next-version (inc expected)
+        new-store (assoc store :version next-version)
+        data (pr-str new-store)
+        result (jdbc/execute! ds
+                 ["INSERT INTO stores (store_id, data, version) VALUES (?, ?, ?)
+                   ON CONFLICT(store_id) DO UPDATE SET
+                     data = excluded.data,
+                     version = excluded.version
+                   WHERE stores.version = ?"
+                  store-id data next-version expected])
+        changed (long (or (:next.jdbc/update-count (first result)) 0))]
+    (if (zero? changed)
+      (throw (ex-info "store version conflict"
+                      {:code :store-conflict :store-id store-id :expected expected}))
+      new-store)))
 
 (defn next-counter!
   "Atomically allocate the next sequential number for one store/table-type

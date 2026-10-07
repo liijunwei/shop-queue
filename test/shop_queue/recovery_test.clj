@@ -19,7 +19,8 @@
       (let [system (core/start-system! db-path)
             ds (:db system)
             ;; Drive the domain to a non-trivial state and persist it.
-            s1 (:state (domain/create-ticket (domain/seed-store {}) 2 "remote"
+            s1 (:state (domain/create-ticket (get-in @(:state system) [:stores "store-1"])
+                                             2 "remote"
                                              1700000000 "tok-1" "id-1"))
             s2 (:state (domain/call-next s1 :two 1700000001))
             _ (storage/save-store! ds "store-1" s2)
@@ -41,7 +42,8 @@
       (let [system1 (core/start-system! db-path)
             ds1 (:db system1)
             ;; 取号 -> 叫号 -> 入座 -> 再取一张 3 人桌，最后落盘。
-            s1 (:state (domain/create-ticket (domain/seed-store {}) 2 "remote"
+            s1 (:state (domain/create-ticket (get-in @(:state system1) [:stores "store-1"])
+                                             2 "remote"
                                              1000 "tok-1" "id-1"))
             s2 (:state (domain/call-next s1 :two 1001))
             s3 (:state (domain/seat s2 :two "id-1" 1002))

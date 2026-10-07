@@ -14,11 +14,16 @@
     (try
       (let [loaded (storage/load-all ds)
             stores (if (seq loaded) loaded {"store-1" (domain/seed-store {})})
-            state (atom {:stores (into {}
-                                      (map (fn [[id s]] [id (domain/seed-store s)]))
-                                      stores)})]
-        (doseq [[id store] (:stores @state)]
-          (storage/save-store! ds id store))
+            seeded (into {}
+                         (map (fn [[id s]] [id (domain/seed-store s)]))
+                         stores)
+            state (atom {:stores seeded})]
+        ;; Persist only brand-new stores (a fresh seed); stores already in the
+        ;; database keep their persisted :version so the optimistic CAS stays in
+        ;; sync and startup never bumps versions pointlessly.
+        (doseq [[id store] seeded
+                :when (not (contains? loaded id))]
+          (swap! state assoc-in [:stores id] (storage/save-store! ds id store)))
         {:db ds :state state
          :subs (atom {:by-token {} :by-table-type {}})
          :events (atom {:seq 0 :by-token {}})})

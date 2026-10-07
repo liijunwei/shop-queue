@@ -32,7 +32,7 @@
   (case code
     (:invalid-party-size :party-size-too-large :invalid-source :no-matching-table-type :invalid-threshold) 400
     :not-found 404
-    (:queue-closed :queue-drained :empty-queue :invalid-transition :queue-too-long :token-conflict) 409
+    (:queue-closed :queue-drained :empty-queue :invalid-transition :queue-too-long :token-conflict :store-conflict) 409
     500))
 
 (defn- domain-error [result]
@@ -178,17 +178,25 @@
     (let [old-store (get-store system store-id)
           result (f old-store)
           record (when op (op result))]
-      (when (:ok result)
-        (jdbc/with-transaction [tx (:db system)]
-          (storage/save-store! tx store-id (:state result))
+      (if (:ok result)
+        (try
+          (let [new-store (jdbc/with-transaction [tx (:db system)]
+                            (let [saved (storage/save-store! tx store-id (:state result))]
+                              (when record
+                                (storage/append-operation! tx store-id record))
+                              saved))]
+            (swap! (:state system) assoc-in [:stores store-id] new-store)
+            (doseq [ev (domain/diff-events old-store new-store)]
+              (publish-event! system ev))
+            result)
+          (catch clojure.lang.ExceptionInfo e
+            (if (= :store-conflict (:code (ex-data e)))
+              {:ok false :error {:code :store-conflict :message "store was modified concurrently, retry"}}
+              (throw e))))
+        (do
           (when record
-            (storage/append-operation! tx store-id record)))
-        (swap! (:state system) assoc-in [:stores store-id] (:state result))
-        (doseq [ev (domain/diff-events old-store (:state result))]
-          (publish-event! system ev)))
-      (when (and record (not (:ok result)))
-        (storage/append-operation! (:db system) store-id record))
-      result)))
+            (storage/append-operation! (:db system) store-id record))
+          result)))))
 
 (defn- transact-create-ticket! [system store-id party-size source idempotency-key token id]
   (locking write-lock
@@ -202,27 +210,32 @@
         (domain/create-ticket old-store party-size source (now-epoch-ms) token id idempotency-key)
 
         :new
-        (let [result (jdbc/with-transaction [tx (:db system)]
-                       (if-not (storage/claim-token! tx store-id token)
-                         {:ok false :error {:code :token-conflict :message "token already exists"}}
-                         (let [tt (:table-type plan)
-                               current (long (get-in old-store [:queues tt :counter] 0))
-                               n (storage/next-counter! tx store-id tt current)
-                               result (domain/create-ticket old-store party-size source (now-epoch-ms) token id idempotency-key n)
-                               new-store (:state result)
-                               record ((op :customer token :create-ticket
-                                         (fn [r] (when-not (:duplicate (:value r))
-                                                   {:kind :ticket :id (:id (:value r))})))
-                                       result)]
-                           (storage/save-store! tx store-id new-store)
-                           (when record
-                             (storage/append-operation! tx store-id record))
-                           result)))]
-          (when (:ok result)
-            (swap! (:state system) assoc-in [:stores store-id] (:state result))
-            (doseq [ev (domain/diff-events old-store (:state result))]
-              (publish-event! system ev)))
-          result)))))
+        (try
+          (let [result (jdbc/with-transaction [tx (:db system)]
+                         (if-not (storage/claim-token! tx store-id token)
+                           {:ok false :error {:code :token-conflict :message "token already exists"}}
+                           (let [tt (:table-type plan)
+                                 current (long (get-in old-store [:queues tt :counter] 0))
+                                 n (storage/next-counter! tx store-id tt current)
+                                 result (domain/create-ticket old-store party-size source (now-epoch-ms) token id idempotency-key n)
+                                 new-store (:state result)
+                                 record ((op :customer token :create-ticket
+                                           (fn [r] (when-not (:duplicate (:value r))
+                                                     {:kind :ticket :id (:id (:value r))})))
+                                         result)
+                                 saved (storage/save-store! tx store-id new-store)]
+                             (when record
+                               (storage/append-operation! tx store-id record))
+                             (assoc result :state saved))))]
+            (when (:ok result)
+              (swap! (:state system) assoc-in [:stores store-id] (:state result))
+              (doseq [ev (domain/diff-events old-store (:state result))]
+                (publish-event! system ev)))
+            result)
+          (catch clojure.lang.ExceptionInfo e
+            (if (= :store-conflict (:code (ex-data e)))
+              {:ok false :error {:code :store-conflict :message "store was modified concurrently, retry"}}
+              (throw e))))))))
 
 ;; ---- Handlers ----
 

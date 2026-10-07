@@ -113,6 +113,37 @@
       (finally
         (io/delete-file db-path true)))))
 
+(deftest save-store-detects-version-conflict
+  (let [db-path (temp-path "shop-queue-cas")
+        ds (storage/init! (storage/connect db-path))]
+    (try
+      (let [v1 (:version (storage/save-store! ds "store-1" (domain/seed-store {})))]
+        (is (= 1 v1))
+        (testing "a stale writer still on version 0 is rejected"
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"store version conflict"
+                                (storage/save-store! ds "store-1" (domain/seed-store {})))))
+        (testing "a writer carrying the current version advances to 2"
+          (is (= 2 (:version (storage/save-store! ds "store-1"
+                                                   (assoc (domain/seed-store {}) :version 1)))))))
+      (finally
+        (io/delete-file db-path true)))))
+
+(deftest create-ticket-returns-409-on-store-version-conflict
+  (let [db-path (temp-path "shop-queue-create-conflict")
+        system (core/start-system! db-path)]
+    (try
+      ;; Simulate a stale reader: rewind the in-memory version so the CAS fails
+      ;; against the already-persisted version.
+      (swap! (:state system) update-in [:stores "store-1" :version] dec)
+      (let [resp ((api/handler system)
+                  {:request-method :post
+                   :uri "/stores/store-1/tickets"
+                   :body (json/generate-string {:party-size 2 :source "remote"})})]
+        (is (= 409 (:status resp)))
+        (is (= "store-conflict" (:error (json/parse-string (:body resp) true)))))
+      (finally
+        (io/delete-file db-path true)))))
+
 (deftest close-then-open-keeps-counter-continuous
   (let [db-path (temp-path "shop-queue-reopen")]
     (try
