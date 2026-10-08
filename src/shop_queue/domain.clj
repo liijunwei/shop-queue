@@ -1,7 +1,8 @@
 (ns shop-queue.domain
   "Pure domain functions for the shop queue. State is ordinary immutable data;
   every command returns either {:ok true :state new-store :value ...} or
-  {:ok false :error {:code .. :message ..}}. No IO happens here.")
+  {:ok false :error {:code .. :message ..}}. No IO happens here."
+  (:require [clojure.string :as str]))
 
 (def default-table-types
   {:two   {:label "2人"  :min 2 :max 2}
@@ -43,6 +44,8 @@
      (-> store
          (assoc :table-types table-types)
          (assoc :queues queues)
+         (assoc :name (:name store))
+         (assoc :status (or (:status store) :active))
          (update :tickets #(or % {}))
          (update :idempotency #(or % {}))
          (update :requeue-threshold #(or % default-requeue-threshold))
@@ -70,6 +73,55 @@
       (ok (seed-store (assoc store :table-types table-types))
           {:table-types table-types}))
     (err :invalid-table-types "table-types must be a map")))
+
+(defn valid-store-name? [name]
+  (and (string? name) (not (str/blank? name))))
+
+(defn create-store
+  "Assemble a fresh store from optional admin config: `:name` (display name,
+  separate from the store id) and `:table-types`. A store starts active, with
+  its three default table-type queues open."
+  ([] (create-store {}))
+  ([{:keys [name table-types]}]
+   (cond
+     (and (some? name) (not (valid-store-name? name)))
+     (err :invalid-store-name "store name must be a non-blank string")
+
+     (and (some? table-types) (not (map? table-types)))
+     (err :invalid-table-types "table-types must be a map")
+
+     :else
+     (let [store (seed-store (cond-> {}
+                               (some? name) (assoc :name (str/trim name))
+                               (some? table-types) (assoc :table-types table-types)))]
+       (ok store {:name (:name store) :table-types (:table-types store)})))))
+
+(defn archive-store
+  "Soft-delete a store: mark it archived without discarding its persisted
+  document or operation history."
+  [store]
+  (ok (assoc (seed-store store) :status :archived) {:status :archived}))
+
+(defn apply-store-config
+  "Apply an optional partial admin update to `:name` and `:requeue-threshold`.
+  `:table-types` changes stay on `set-table-types` so config-snapshot semantics
+  are preserved."
+  [store {:keys [name requeue-threshold]}]
+  (let [store (seed-store store)]
+    (cond
+      (and (some? name) (not (valid-store-name? name)))
+      (err :invalid-store-name "store name must be a non-blank string")
+
+      (and (some? requeue-threshold)
+           (not (and (integer? requeue-threshold) (not (neg? requeue-threshold)))))
+      (err :invalid-threshold "requeue-threshold must be a non-negative integer")
+
+      :else
+      (let [updated (cond-> store
+                      (some? name) (assoc :name (str/trim name))
+                      (some? requeue-threshold) (assoc :requeue-threshold requeue-threshold))]
+        (ok updated {:name (:name updated)
+                     :requeue-threshold (:requeue-threshold updated)})))))
 
 ;; ---- Derived views (single source of truth is :tickets + :n) ----
 
@@ -346,7 +398,10 @@
 
 (defn store-view [store]
   (let [store (seed-store store)]
-    {:table-types (:table-types store)
+    {:name (:name store)
+     :status (:status store)
+     :table-types (:table-types store)
+     :requeue-threshold (:requeue-threshold store)
      :queues (into {}
                    (map (fn [[tt q]]
                           [tt {:status (:status q)

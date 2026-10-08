@@ -377,3 +377,29 @@
       (is (= [1 2 3] (mapv :seq (d/query-operations ops {:since 200})))))
     (testing "combined filters"
       (is (= [3] (mapv :seq (d/query-operations ops {:actor :customer :action :cancel})))))))
+
+(deftest store-lifecycle
+  (testing "create-store seeds defaults and accepts name/table-types"
+    (let [r (d/create-store {:name "  滨江店  "})]
+      (is (:ok r))
+      (is (= "滨江店" (:name (:state r))))
+      (is (= :active (:status (:state r))))
+      (is (= d/default-table-types (:table-types (:state r))))))
+  (testing "create-store validates name and table-types"
+    (is (= :invalid-store-name (get-in (d/create-store {:name "   "}) [:error :code])))
+    (is (= :invalid-table-types (get-in (d/create-store {:table-types [:two]}) [:error :code]))))
+  (testing "archive-store marks archived and preserves ticket data"
+    (let [s (-> (d/create-store {})
+                :state
+                (assoc-in [:tickets "id-1"] {:status :waiting}))
+          r (d/archive-store s)]
+      (is (:ok r))
+      (is (= :archived (:status (:state r))))
+      (is (= :waiting (get-in (:state r) [:tickets "id-1" :status])))))
+  (testing "apply-store-config updates name and requeue-threshold"
+    (let [r (d/apply-store-config {} {:name "新店" :requeue-threshold 3})]
+      (is (:ok r))
+      (is (= "新店" (:name (:state r))))
+      (is (= 3 (:requeue-threshold (:state r)))))
+    (is (= :invalid-store-name (get-in (d/apply-store-config {} {:name ""}) [:error :code])))
+    (is (= :invalid-threshold (get-in (d/apply-store-config {} {:requeue-threshold -1}) [:error :code])))))
