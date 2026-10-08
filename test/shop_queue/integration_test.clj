@@ -51,6 +51,17 @@
   (post* path {:headers {"Content-Type" "application/json"}
                :body (json/generate-string body)}))
 
+(defn- patch-json [path body]
+  (req (client/patch path {:headers {"Content-Type" "application/json"}
+                           :body (json/generate-string body)})))
+
+(defn- put-json [path body]
+  (req (client/put path {:headers {"Content-Type" "application/json"}
+                         :body (json/generate-string body)})))
+
+(defn- delete* [path]
+  (req (client/delete path)))
+
 (defn- uuid-string? [s]
   (boolean (try (java.util.UUID/fromString s) (catch Exception _ nil))))
 
@@ -589,5 +600,66 @@
             (is (= 2 (:seq s2)))
             (is (= 1 (:last-event-id s2))))
           (close-sse c2))))))
+
+(deftest store-lifecycle-http
+  (testing "创建门店：服务端生成 id，name 与 id 分离，三条桌型队列默认开启"
+    (let [r (post-json (url "stores") {:name "滨江店"})
+          b (:body r)]
+      (is (= 201 (:status r)))
+      (is (uuid-string? (:id b)))
+      (is (= "滨江店" (:name b)))
+      (is (= "active" (:status b)))
+      (is (= #{:two :three :large} (set (keys (:queues b)))))
+      (is (= "open" (get-in b [:queues :two :status])))))
+  (testing "GET /stores 列表只返回活跃门店，GET /stores/{id} 返回详情"
+    (let [id (:id (:body (post-json (url "stores") {:name "人民广场店"})))
+          stores (:stores (:body (get* "stores")))
+          detail (:body (get* "stores" id))]
+      (is (contains? stores (keyword id)))
+      (is (not (contains? stores :store-9)))
+      (is (= id (:id detail)))
+      (is (= "人民广场店" (:name detail)))
+      (is (= "active" (:status detail))))
+  (testing "PATCH 改名与阈值，PUT 改桌型配置"
+    (let [id (:id (:body (post-json (url "stores") {})))
+          patched (patch-json (url "stores" id) {:name "陆家嘴店" :requeue-threshold 7})
+          detail (:body (get* "stores" id))]
+      (is (= 200 (:status patched)))
+      (is (= "陆家嘴店" (:name detail)))
+      (is (= 7 (:requeue-threshold detail)))
+      (let [tt (put-json (url "stores" id "table-types")
+                         {:table-types (dissoc domain/default-table-types :large)})
+            detail2 (:body (get* "stores" id))]
+        (is (= 200 (:status tt)))
+        (is (= #{:two :three} (set (keys (:table-types detail2))))))))
+  (testing "DELETE 归档：不物理删除，列表隐藏且后续请求统一 404"
+    (let [id (:id (:body (post-json (url "stores") {:name "打烊店"})))
+          del (delete* (url "stores" id))]
+      (is (= 200 (:status del)))
+      (is (= "archived" (:status (:body del))))
+      (is (not (contains? (:stores (:body (get* "stores"))) (keyword id))))
+      (is (= 404 (:status (get* "stores" id))))
+      (is (= 404 (:status (post-json (url "stores" id "tickets") {:party-size 2 :source "remote"}))))))
+  (testing "创建校验：非法 name / table-types 返回 400"
+    (is (= 400 (:status (post-json (url "stores") {:name "   "}))))
+    (is (= 400 (:status (post-json (url "stores") {:table-types [:two]})))))))
+
+(deftest queue-sse-isolation-by-store
+  (let [a (:id (:body (post-json (url "stores") {:name "A"})))
+        b (:id (:body (post-json (url "stores") {:name "B"})))
+        sse-url (str "http://127.0.0.1:" *port* "/stores/" a "/queues/two/events")
+        c (open-sse sse-url nil)]
+    (is (= "snapshot" (:event (read-sse-event (:in c)))))
+    (testing "B 店 two 队列叫号不会串到 A 店订阅"
+      (post-json (url "stores" b "tickets") {:party-size 2 :source "remote"})
+      (post* (url "stores" b "queues" "two" "call"))
+      (is (= ::timeout (read-sse-event (:in c)))))
+    (testing "A 店 two 队列叫号推送到 A 店订阅"
+      (let [t (:body (post-json (url "stores" a "tickets") {:party-size 2 :source "remote"}))]
+        (post* (url "stores" a "queues" "two" "call"))
+        (let [ev (read-sse-event (:in c))]
+          (is (= "called" (:event ev)))
+          (is (= (:id t) (:ticket-id (json/parse-string (:data ev) true)))))))
+    (close-sse c)))
 
 (comment (full-store-queue-flow))

@@ -30,7 +30,7 @@
 
 (defn- error-status [code]
   (case code
-    (:invalid-party-size :party-size-too-large :invalid-source :no-matching-table-type :invalid-threshold) 400
+    (:invalid-party-size :party-size-too-large :invalid-source :no-matching-table-type :invalid-threshold :invalid-store-name :invalid-table-types) 400
     :not-found 404
     (:queue-closed :queue-drained :empty-queue :invalid-transition :queue-too-long :token-conflict :store-conflict) 409
     500))
@@ -135,11 +135,14 @@
             payload {:seq seq :type (:type ev) :ticket-id (:ticket-id ev) :table-type (:table-type ev)}]
         (remember-event! events (:token ev) payload)
         (doseq [ch (get-in @subs [:by-token (:token ev)])]
+          (send-event! ch seq (:type ev) payload))
+        (doseq [ch (get-in @subs [:by-table-type [(:store-id ev) (:table-type ev)]])]
           (send-event! ch seq (:type ev) payload)))
       :queue
       (let [seq (next-seq! events)
-            payload {:seq seq :type (:type ev) :table-type (:table-type ev)}]
-        (doseq [ch (get-in @subs [:by-table-type (:table-type ev)])]
+            store-id (:store-id ev)
+            payload {:seq seq :type (:type ev) :store-id store-id :table-type (:table-type ev)}]
+        (doseq [ch (get-in @subs [:by-table-type [store-id (:table-type ev)]])]
           (send-event! ch seq (:type ev) payload)))
       nil)))
 
@@ -147,7 +150,9 @@
 
 (defn- get-store [system store-id]
   (when-let [store (get-in @(:state system) [:stores store-id])]
-    (domain/seed-store store)))
+    (let [seeded (domain/seed-store store)]
+      (when (= :active (:status seeded))
+        seeded))))
 
 (defn- op [actor actor-id action target-fn]
   (fn [result]
@@ -187,7 +192,7 @@
                               saved))]
             (swap! (:state system) assoc-in [:stores store-id] new-store)
             (doseq [ev (domain/diff-events old-store new-store)]
-              (publish-event! system ev))
+              (publish-event! system (assoc ev :store-id store-id)))
             result)
           (catch clojure.lang.ExceptionInfo e
             (if (= :store-conflict (:code (ex-data e)))
@@ -230,7 +235,7 @@
             (when (:ok result)
               (swap! (:state system) assoc-in [:stores store-id] (:state result))
               (doseq [ev (domain/diff-events old-store (:state result))]
-                (publish-event! system ev)))
+                (publish-event! system (assoc ev :store-id store-id))))
             result)
           (catch clojure.lang.ExceptionInfo e
             (if (= :store-conflict (:code (ex-data e)))
@@ -239,16 +244,68 @@
 
 ;; ---- Handlers ----
 
-(defn- home [system]
+(defn- stores-list! [system]
   (json-response 200
     {:stores (into {}
-                   (map (fn [[id s]] [id (domain/store-view s)]))
+                   (keep (fn [[id s]]
+                           (when (= :active (:status s))
+                             [id (domain/store-view s)])))
                    (:stores @(:state system))) }))
+
+(defn- home [system] (stores-list! system))
 
 (defn- healthz! [system]
   (if (storage/writable? (:db system))
     (json-response 200 {:status "ok" :db "writable"})
     (json-response 503 {:status "unavailable" :db "not-writable"})))
+
+(defn- create-store! [system req]
+  (let [body (parse-json req)
+        result (domain/create-store (select-keys body [:name :table-types]))]
+    (if-not (:ok result)
+      (domain-error result)
+      (locking write-lock
+        (let [store-id (str (java.util.UUID/randomUUID))
+              record ((op :staff "staff" :create-store
+                          (constantly {:kind :store}))
+                      result)
+              new-store (jdbc/with-transaction [tx (:db system)]
+                          (let [saved (storage/save-store! tx store-id (:state result))]
+                            (storage/append-operation! tx store-id record)
+                            saved))]
+          (swap! (:state system) assoc-in [:stores store-id] new-store)
+          (json-response 201 (assoc (domain/store-view new-store) :id store-id)))))))
+
+(defn- store-detail! [system store-id]
+  (if-let [store (get-store system store-id)]
+    (json-response 200 (assoc (domain/store-view store) :id store-id))
+    (not-found "store not found")))
+
+(defn- update-store! [system store-id req]
+  (if-not (get-store system store-id)
+    (not-found "store not found")
+    (let [body (parse-json req)
+          result (transact! system store-id
+                   (fn [s] (domain/apply-store-config s (select-keys body [:name :requeue-threshold])))
+                   (op :staff "staff" :update-store (constantly {:kind :store})))]
+      (if (:ok result) (json-response 200 (:value result)) (domain-error result)))))
+
+(defn- set-table-types! [system store-id req]
+  (if-not (get-store system store-id)
+    (not-found "store not found")
+    (let [body (parse-json req)
+          result (transact! system store-id
+                   (fn [s] (domain/set-table-types s (:table-types body)))
+                   (op :staff "staff" :set-table-types (constantly {:kind :store})))]
+      (if (:ok result) (json-response 200 (:value result)) (domain-error result)))))
+
+(defn- archive-store! [system store-id]
+  (if-not (get-store system store-id)
+    (not-found "store not found")
+    (let [result (transact! system store-id
+                   (fn [s] (domain/archive-store s))
+                   (op :staff "staff" :archive-store (constantly {:kind :store})))]
+      (if (:ok result) (json-response 200 (:value result)) (domain-error result)))))
 
 (defn- create-ticket! [system store-id req]
   (if-not (get-store system store-id)
@@ -392,6 +449,30 @@
                      (unsubscribe! (:subs system) :by-token token ch))}))
     (not-found "ticket not found")))
 
+(defn- queue-sse! [system req store-id tt]
+  (if-let [store (get-store system store-id)]
+    (if-not (contains? (:queues store) tt)
+      (not-found "unknown table type")
+      (http/as-channel req
+        {:on-open (fn [ch]
+                    (subscribe! (:subs system) :by-table-type [store-id tt] ch)
+                    (let [store (get-store system store-id)
+                          seq (:seq @(:events system))
+                          snapshot-data (assoc (domain/queue-view store tt)
+                                               :seq seq
+                                               :store-id store-id)
+                          body (sse-frame :snapshot seq snapshot-data)]
+                      (http/send! ch
+                        {:status 200
+                         :headers {"Content-Type" "text/event-stream; charset=utf-8"
+                                   "Cache-Control" "no-cache"
+                                   "Connection" "keep-alive"}
+                         :body body}
+                        false)))
+         :on-close (fn [ch _status]
+                     (unsubscribe! (:subs system) :by-table-type [store-id tt] ch))}))
+    (not-found "store not found")))
+
 (defn- dispatch [system req]
   (let [m (:request-method req)
         s (segments (:uri req))]
@@ -401,6 +482,24 @@
 
       (and (= :get m) (empty? s))
       (home system)
+
+      (and (= :get m) (= 1 (count s)) (= "stores" (nth s 0)))
+      (stores-list! system)
+
+      (and (= :post m) (= 1 (count s)) (= "stores" (nth s 0)))
+      (create-store! system req)
+
+      (and (= :get m) (= 2 (count s)) (= "stores" (nth s 0)))
+      (store-detail! system (nth s 1))
+
+      (and (= :patch m) (= 2 (count s)) (= "stores" (nth s 0)))
+      (update-store! system (nth s 1) req)
+
+      (and (= :delete m) (= 2 (count s)) (= "stores" (nth s 0)))
+      (archive-store! system (nth s 1))
+
+      (and (= :put m) (= 3 (count s)) (= "stores" (nth s 0)) (= "table-types" (nth s 2)))
+      (set-table-types! system (nth s 1) req)
 
       (and (= :post m) (= 3 (count s)) (= "stores" (nth s 0)) (= "tickets" (nth s 2)))
       (create-ticket! system (nth s 1) req)
@@ -425,6 +524,9 @@
 
       (and (= :get m) (= 4 (count s)) (= "stores" (nth s 0)) (= "events" (nth s 2)))
       (sse! system req (nth s 1) (nth s 3))
+
+      (and (= :get m) (= 5 (count s)) (= "stores" (nth s 0)) (= "queues" (nth s 2)) (= "events" (nth s 4)))
+      (queue-sse! system req (nth s 1) (keyword (nth s 3)))
 
       (and (= :get m) (= 3 (count s)) (= "stores" (nth s 0)) (= "operations" (nth s 2)))
       (operations-list! system (nth s 1) req)
