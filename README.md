@@ -37,6 +37,25 @@
 一句话：当前是占位参数的演示，数据价值还只是示意；一旦接入真实流量，上面每一行
 都能变成一条可执行决策。
 
+## 多店 API
+
+单库多店：一个 SQLite 文件里按 `store-id` 存多个店铺。`store-id` 由服务端生成
+UUID（用于 URL），展示名独立放在 `:name`。门店生命周期与每店配置端点：
+
+- `POST /stores`（body 可选 `name` / `table-types`）—— 创建，201 返回 `id` + 视图。
+- `GET /stores` —— 活跃门店列表（归档店不出现）。
+- `GET /stores/{id}` —— 单店详情（`name` / `status` / `table-types` /
+  `requeue-threshold` / `queues`）。
+- `PATCH /stores/{id}`（body 可选 `name` / `requeue-threshold`）—— 改名 / 阈值。
+- `PUT /stores/{id}/table-types`（body `table-types`）—— 改桌型配置；只影响未来取号，
+  历史票保留原桌型（config-snapshot）。
+- `DELETE /stores/{id}` —— 归档（软删除）：列表隐藏、后续请求统一 404，文档与
+  `operations` 仍保留在库中。
+
+队列级实时订阅：`GET /stores/{id}/queues/{tt}/events`（SSE）先发 `snapshot`，随后
+推送该店该桌型的 `called / seated / no-show / cancelled` 与队列开关事件；订阅按
+`[store-id table-type]` 隔离，不会跨店串流。
+
 ## 边界与约定（写死，防止误上生产）
 
 **无鉴权，仅限原型。** 当前所有端点都没有鉴权：任何知道 URL 的人都能取号、
