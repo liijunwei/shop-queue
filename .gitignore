@@ -16,3 +16,4 @@ pom.xml.asc
 .lsp/
 queue.db*
 queue-test.db
+*.db
